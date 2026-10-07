@@ -179,7 +179,10 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return resolveProcessNameByProcEntries(files, inode, uid)
+}
 
+func resolveProcessNameByProcEntries(files []os.DirEntry, inode, uid uint32) (string, error) {
 	buffer := make([]byte, unix.PathMax)
 	socket := fmt.Appendf(nil, "socket:[%d]", inode)
 
@@ -190,6 +193,9 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
 
 		info, err := f.Info()
 		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
 			return "", err
 		}
 		if info.Sys().(*syscall.Stat_t).Uid != uid {
