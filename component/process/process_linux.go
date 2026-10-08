@@ -63,6 +63,12 @@ type inetDiagResponse struct {
 }
 
 func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
+	if owner, ok := lookupSockOwner(network, ip, srcPort); ok {
+		if path, err := resolveSockOwnerPath(owner); err == nil {
+			return owner.UID, path, nil
+		}
+	}
+
 	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort)
 	if runtime.GOOS == "android" {
 		// on Android (especially recent releases), netlink INET_DIAG can fail or return UID 0 / empty process info for some apps

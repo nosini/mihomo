@@ -25,6 +25,13 @@ lan-disallowed-ips: # 禁止连接的 IP 地址段，黑名单优先级高于白
 #  - off, 不匹配进程，推荐在路由器上使用此模式
 find-process-mode: strict
 
+# Linux：mihomo-sockowner（component/process/ebpf/loader）pin 到 bpffs 的 BPF map，记录每个连接所属的进程。
+# 连接关闭后仍可查到进程，且无需扫描 /proc；该 map 不存在时使用原有查找方式。设为 "" 关闭
+# Linux: BPF map pinned by mihomo-sockowner (component/process/ebpf/loader) that records the
+# process behind each connection, so lookups work after the socket has closed and don't scan
+# /proc. Falls back to the usual lookup when the map is absent. Set to "" to turn it off.
+find-process-bpf-map: /sys/fs/bpf/mihomo/maps/conn_owners
+
 mode: rule
 
 #自定义 geodata url
