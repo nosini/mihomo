@@ -61,6 +61,7 @@ type General struct {
 	GeositeMatcher    string                  `json:"geosite-matcher"`
 	TCPConcurrent     bool                    `json:"tcp-concurrent"`
 	FindProcessMode   process.FindProcessMode `json:"find-process-mode"`
+	FindProcessBPFMap string                  `json:"find-process-bpf-map"`
 	Sniffing          bool                    `json:"sniffing"`
 	GlobalUA          string                  `json:"global-ua"`
 	ETagSupport       bool                    `json:"etag-support"`
@@ -441,6 +442,7 @@ type RawConfig struct {
 	GeositeMatcher                string                  `yaml:"geosite-matcher" json:"geosite-matcher"`
 	TCPConcurrent                 bool                    `yaml:"tcp-concurrent" json:"tcp-concurrent"`
 	FindProcessMode               process.FindProcessMode `yaml:"find-process-mode" json:"find-process-mode"`
+	FindProcessBPFMap             string                  `yaml:"find-process-bpf-map" json:"find-process-bpf-map"`
 	GlobalClientFingerprint       string                  `yaml:"global-client-fingerprint" json:"global-client-fingerprint"`
 	GlobalUA                      string                  `yaml:"global-ua" json:"global-ua"`
 	ETagSupport                   bool                    `yaml:"etag-support" json:"etag-support"`
@@ -500,6 +502,7 @@ func DefaultRawConfig() *RawConfig {
 		ProxyGroup:        []map[string]any{},
 		TCPConcurrent:     false,
 		FindProcessMode:   process.FindProcessStrict,
+		FindProcessBPFMap: process.DefaultSockOwnerMap,
 		GlobalUA:          "clash.meta/" + C.Version,
 		ETagSupport:       true,
 		DNS: RawDNS{
@@ -797,6 +800,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 		GeositeMatcher:    cfg.GeositeMatcher,
 		TCPConcurrent:     cfg.TCPConcurrent,
 		FindProcessMode:   cfg.FindProcessMode,
+		FindProcessBPFMap: cfg.FindProcessBPFMap,
 		GlobalUA:          cfg.GlobalUA,
 		ETagSupport:       cfg.ETagSupport,
 		KeepAliveIdle:     cfg.KeepAliveIdle,
