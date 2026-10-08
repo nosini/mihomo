@@ -10,3 +10,12 @@ func SetSockOwnerMap(path string) { sockOwnerMapPath = path }
 
 // SockOwnerMap returns the configured map path.
 func SockOwnerMap() string { return sockOwnerMapPath }
+
+var sockOwnerOnly bool
+
+// SetSockOwnerOnly sets whether process lookup uses the BPF maps alone, which
+// only exist on Linux.
+func SetSockOwnerOnly(only bool) { sockOwnerOnly = only }
+
+// SockOwnerOnly reports whether process lookup uses the BPF maps alone.
+func SockOwnerOnly() bool { return sockOwnerOnly }
