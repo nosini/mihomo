@@ -18,6 +18,10 @@ const (
 	UDP = "udp"
 )
 
+// DefaultSockOwnerMap is where the independently installed socketowner loader
+// pins the map used on Linux.
+const DefaultSockOwnerMap = "/sys/fs/bpf/mihomo/maps/conn_owners"
+
 func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, string, error) {
 	return findProcessName(network, srcIP, srcPort)
 }
