@@ -468,3 +468,94 @@ func TestSockOwnerRestoresEvicted(t *testing.T) {
 		}
 	}
 }
+
+func requireExecMaps(t *testing.T) {
+	requireMap(t)
+	sockOwners.mu.RLock()
+	defer sockOwners.mu.RUnlock()
+	if sockOwners.tasksFd < 0 {
+		t.Skip("exec-path maps not available next to " + SockOwnerMap())
+	}
+}
+
+// With the exec-path maps, a process that has exited is still named, from
+// exec_recent.
+func TestExecPathOwnerExited(t *testing.T) {
+	requireExecMaps(t)
+	child := childBinary(t)
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	buf := make([]byte, 16)
+	for i := 0; i < rounds; i++ {
+		cmd, stdin, _ := startChild(t, child, "udp-exit", pc.LocalAddr().String(), nil)
+		_, from, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd.Wait()
+		stdin.Close()
+		r := lookupBPF("udp", from.(*net.UDPAddr).AddrPort())
+		if r.err != nil || r.path != child {
+			t.Fatalf("round %d: %q, %v", i, r.path, r.err)
+		}
+	}
+}
+
+// A record only names an owner if the process started before the owner was
+// recorded; otherwise the process ID was reused.
+func TestExecPathRejectsLaterProcess(t *testing.T) {
+	requireExecMaps(t)
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := sockOwnerValue{Tgid: uint32(os.Getpid())}
+	var ts unix.Timespec
+	unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts)
+	owner.BootNs = uint64(ts.Nano())
+	sockOwners.mu.RLock()
+	path, err := sockOwners.execPathLocked(owner)
+	sockOwners.mu.RUnlock()
+	if err != nil || path != self {
+		t.Fatalf("own process: %q, %v", path, err)
+	}
+
+	owner.BootNs = 1 // before this process started
+	sockOwners.mu.RLock()
+	path, err = sockOwners.execPathLocked(owner)
+	sockOwners.mu.RUnlock()
+	if err == nil {
+		t.Fatalf("named an owner recorded before the process started: %q", path)
+	}
+}
+
+// With SetSockOwnerOnly, lookups that the maps can't answer fail instead of
+// searching /proc.
+func TestSockOwnerOnly(t *testing.T) {
+	requireExecMaps(t)
+	SetSockOwnerOnly(true)
+	defer SetSockOwnerOnly(false)
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	c, err := net.Dial("tcp4", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	src := c.LocalAddr().(*net.TCPAddr).AddrPort()
+	self, _ := os.Executable()
+	if _, path, err := findProcessName("tcp", src.Addr(), int(src.Port())); err != nil || path != self {
+		t.Fatalf("own connection: %q, %v", path, err)
+	}
+	// A socket that existed before the programs were attached has no owner;
+	// an unused port stands in for it.
+	if _, path, err := findProcessName("tcp", src.Addr(), 1); err != ErrNotFound {
+		t.Fatalf("unknown connection: %q, %v", path, err)
+	}
+}

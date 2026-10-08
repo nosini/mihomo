@@ -62,6 +62,7 @@ type General struct {
 	TCPConcurrent     bool                    `json:"tcp-concurrent"`
 	FindProcessMode   process.FindProcessMode `json:"find-process-mode"`
 	FindProcessBPFMap string                  `json:"find-process-bpf-map"`
+	FindProcBPFOnly   bool                    `json:"find-process-bpf-only"`
 	Sniffing          bool                    `json:"sniffing"`
 	GlobalUA          string                  `json:"global-ua"`
 	ETagSupport       bool                    `json:"etag-support"`
@@ -443,6 +444,7 @@ type RawConfig struct {
 	TCPConcurrent                 bool                    `yaml:"tcp-concurrent" json:"tcp-concurrent"`
 	FindProcessMode               process.FindProcessMode `yaml:"find-process-mode" json:"find-process-mode"`
 	FindProcessBPFMap             string                  `yaml:"find-process-bpf-map" json:"find-process-bpf-map"`
+	FindProcessBPFOnly            bool                    `yaml:"find-process-bpf-only" json:"find-process-bpf-only"`
 	GlobalClientFingerprint       string                  `yaml:"global-client-fingerprint" json:"global-client-fingerprint"`
 	GlobalUA                      string                  `yaml:"global-ua" json:"global-ua"`
 	ETagSupport                   bool                    `yaml:"etag-support" json:"etag-support"`
@@ -801,6 +803,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 		TCPConcurrent:     cfg.TCPConcurrent,
 		FindProcessMode:   cfg.FindProcessMode,
 		FindProcessBPFMap: cfg.FindProcessBPFMap,
+		FindProcBPFOnly:   cfg.FindProcessBPFOnly,
 		GlobalUA:          cfg.GlobalUA,
 		ETagSupport:       cfg.ETagSupport,
 		KeepAliveIdle:     cfg.KeepAliveIdle,

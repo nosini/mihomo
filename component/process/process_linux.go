@@ -68,6 +68,9 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
 			return owner.UID, path, nil
 		}
 	}
+	if SockOwnerOnly() {
+		return 0, "", ErrNotFound
+	}
 
 	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort)
 	if runtime.GOOS == "android" {
