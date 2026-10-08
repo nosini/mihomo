@@ -174,6 +174,7 @@ func GetGeneral() *config.General {
 		TCPConcurrent:     dialer.GetTcpConcurrent(),
 		FindProcessMode:   tunnel.FindProcessMode(),
 		FindProcessBPFMap: process.SockOwnerMap(),
+		FindProcBPFOnly:   process.SockOwnerOnly(),
 		Sniffing:          tunnel.IsSniffing(),
 		GlobalUA:          mihomoHttp.UA(),
 		ETagSupport:       resource.ETag(),
@@ -396,6 +397,7 @@ func updateGeneral(general *config.General, logging bool) {
 	tunnel.SetMode(general.Mode)
 	tunnel.SetFindProcessMode(general.FindProcessMode)
 	process.SetSockOwnerMap(general.FindProcessBPFMap)
+	process.SetSockOwnerOnly(general.FindProcBPFOnly)
 	resolver.DisableIPv6 = !general.IPv6
 
 	dialer.SetTcpConcurrent(general.TCPConcurrent)
