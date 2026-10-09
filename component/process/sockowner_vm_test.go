@@ -54,6 +54,11 @@ func runChild(mode, addr string) {
 		if err := syscall.Connect(3, sa); err != nil {
 			os.Exit(1)
 		}
+	case "inherited-write":
+		// Sends on a connected socket, which skips the sendmsg hooks.
+		if _, err := syscall.Write(3, []byte("x")); err != nil {
+			os.Exit(1)
+		}
 	case "udp-reconnect":
 		// Disconnecting an autobound UDP socket releases its port, so
 		// the second datagram leaves from a new one.
@@ -148,6 +153,14 @@ func (t *tally) add(r lookupResult) {
 	t.n++
 }
 
+// expectChild fails the test unless every lookup named the child.
+func (t *tally) expectChild(tb testing.TB) {
+	tb.Helper()
+	if t.hits["sockowner-child"] != t.n {
+		tb.Errorf("child named in %d of %d lookups", t.hits["sockowner-child"], t.n)
+	}
+}
+
 func (t *tally) String() string {
 	return fmt.Sprintf("found %v, failed %v, mean %v", t.hits, t.errors, t.total/time.Duration(t.n))
 }
@@ -222,6 +235,7 @@ func TestSockOwnerTCP(t *testing.T) {
 	}
 	t.Logf("bpf:    %v", &bpf)
 	t.Logf("legacy: %v", &legacy)
+	bpf.expectChild(t)
 }
 
 func testUDP(t *testing.T, mode string) {
@@ -251,6 +265,13 @@ func testUDP(t *testing.T, mode string) {
 	}
 	t.Logf("bpf:    %v", &bpf)
 	t.Logf("legacy: %v", &legacy)
+	sockOwners.mu.RLock()
+	execMaps := sockOwners.tasksFd >= 0
+	sockOwners.mu.RUnlock()
+	// Without the exec-path maps, an owner that has exited can't be named.
+	if mode != "udp-exit" || execMaps {
+		bpf.expectChild(t)
+	}
 }
 
 // The child sends one datagram from a socket it closes straight away but keeps
@@ -292,6 +313,44 @@ func TestSockOwnerInherited(t *testing.T) {
 	}
 	t.Logf("bpf:    %v (test binary is %s)", &bpf, filepath.Base(os.Args[0]))
 	t.Logf("legacy: %v", &legacy)
+	bpf.expectChild(t)
+}
+
+// The test process connects a UDP socket and passes it to the child, which
+// sends on it with write() while the test process stays alive. The datagram
+// belongs to the child.
+func TestSockOwnerPassedConnected(t *testing.T) {
+	requireExecMaps(t) // record_send is attached with -exec-paths
+	child := childBinary(t)
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	ap := pc.LocalAddr().(*net.UDPAddr).AddrPort()
+	buf := make([]byte, 16)
+	var bpf tally
+	for i := 0; i < rounds; i++ {
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Connect(fd, &syscall.SockaddrInet4{Port: int(ap.Port()), Addr: ap.Addr().As4()}); err != nil {
+			t.Fatal(err)
+		}
+		f := os.NewFile(uintptr(fd), "socket")
+		cmd, stdin, _ := startChild(t, child, "inherited-write", ap.String(), f)
+		f.Close()
+		_, from, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bpf.add(lookupBPF("udp", from.(*net.UDPAddr).AddrPort()))
+		stdin.Close()
+		cmd.Wait()
+	}
+	t.Logf("bpf: %v (test binary is %s)", &bpf, filepath.Base(os.Args[0]))
+	bpf.expectChild(t)
 }
 
 func bpfCall(cmd uintptr, attr unsafe.Pointer, size uintptr) (uintptr, error) {
@@ -557,5 +616,66 @@ func TestSockOwnerOnly(t *testing.T) {
 	// an unused port stands in for it.
 	if _, path, err := findProcessName("tcp", src.Addr(), 1); err != ErrNotFound {
 		t.Fatalf("unknown connection: %q, %v", path, err)
+	}
+}
+
+// When the exec-path maps can't be opened along with the socket-owner map,
+// they are retried, although the socket-owner map stays the same.
+func TestExecMapsRetried(t *testing.T) {
+	requireExecMaps(t)
+	dir := filepath.Dir(SockOwnerMap())
+	pin := fmt.Sprintf("/sys/fs/bpf/mihomo-test-%d", os.Getpid())
+	if err := os.Mkdir(pin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(pin)
+	repin := func(name string) {
+		fd, err := openPinnedRW(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(fd)
+		if err := pinObject(fd, filepath.Join(pin, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	repin("conn_owners")
+	repin(execRecentMap)
+	// A map of the wrong type stands in for exec_tasks.
+	attr := struct {
+		Type       uint32
+		KeySize    uint32
+		ValueSize  uint32
+		MaxEntries uint32
+	}{unix.BPF_MAP_TYPE_ARRAY, 4, 4, 1}
+	fd, err := bpfCall(unix.BPF_MAP_CREATE, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = pinObject(int(fd), filepath.Join(pin, execTasksMap))
+	unix.Close(int(fd))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previous := SockOwnerMap()
+	SetSockOwnerMap(filepath.Join(pin, "conn_owners"))
+	defer SetSockOwnerMap(previous)
+	state := func() (connOpen, execOpen bool) {
+		sockOwners.mu.Lock()
+		defer sockOwners.mu.Unlock()
+		sockOwners.checkedAt = time.Time{} // check the pins on the next lookup
+		return sockOwners.fd >= 0, sockOwners.tasksFd >= 0
+	}
+	state()
+	sockOwners.lookup(func(int, uint64) bool { return false })
+	if connOpen, execOpen := state(); !connOpen || execOpen {
+		t.Fatalf("with a wrong exec_tasks: socket-owner map open %v, exec maps open %v", connOpen, execOpen)
+	}
+	os.Remove(filepath.Join(pin, execTasksMap))
+	repin(execTasksMap)
+	sockOwners.lookup(func(int, uint64) bool { return false })
+	if connOpen, execOpen := state(); !connOpen || !execOpen {
+		t.Fatalf("after fixing exec_tasks: socket-owner map open %v, exec maps open %v", connOpen, execOpen)
 	}
 }

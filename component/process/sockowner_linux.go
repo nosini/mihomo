@@ -72,16 +72,17 @@ func (v *execPathValue) ownedBy(owner sockOwnerValue) bool {
 // executable comes from the exec-path maps where the loader pinned them, and
 // from /proc otherwise.
 type sockOwnerMap struct {
-	mu        sync.RWMutex
-	path      string
-	only      bool
-	fd        int
-	tasksFd   int
-	recentFd  int
-	ino       uint64 // of the pinned file, to notice a new pin
-	netns     uint64
-	checkedAt time.Time
-	warned    bool
+	mu         sync.RWMutex
+	path       string
+	only       bool
+	fd         int
+	tasksFd    int
+	recentFd   int
+	ino        uint64 // of the pinned file, to notice a new pin
+	netns      uint64
+	checkedAt  time.Time
+	warned     bool
+	execWarned bool
 }
 
 var sockOwners = &sockOwnerMap{path: DefaultSockOwnerMap, fd: -1, tasksFd: -1, recentFd: -1}
@@ -99,6 +100,7 @@ func SetSockOwnerMap(path string) {
 	m.path = path
 	m.checkedAt = time.Time{}
 	m.warned = false
+	m.execWarned = false
 }
 
 // SockOwnerMap returns the configured map path.
@@ -170,34 +172,52 @@ func (m *sockOwnerMap) refreshLocked() {
 		}
 		return
 	}
-	if m.fd >= 0 && st.Ino == m.ino {
-		return
-	}
-	m.closeLocked()
-	fd, netns, err := openSockOwnerMap(m.path)
-	if err != nil {
-		m.warnLocked(err)
-		return
-	}
-	m.fd, m.ino, m.netns = fd, st.Ino, netns
-	m.warned = false
-	// The loader pins the exec-path maps before the socket-owner map, so
-	// they are in place when a new socket-owner map is.
-	dir := filepath.Dir(m.path)
-	tasksFd, err := openBPFMap(filepath.Join(dir, execTasksMap), unix.BPF_MAP_TYPE_TASK_STORAGE, 4, execPathValue{})
-	if err == nil {
-		recentFd, err := openBPFMap(filepath.Join(dir, execRecentMap), unix.BPF_MAP_TYPE_LRU_HASH, 4, execPathValue{})
-		if err == nil {
-			m.tasksFd, m.recentFd = tasksFd, recentFd
-			log.Infoln("[Process] Using socket owners and executables recorded in %s", dir)
+	opened := false
+	if m.fd < 0 || st.Ino != m.ino {
+		m.closeLocked()
+		fd, netns, err := openSockOwnerMap(m.path)
+		if err != nil {
+			m.warnLocked(err)
 			return
 		}
-		unix.Close(tasksFd)
+		m.fd, m.ino, m.netns = fd, st.Ino, netns
+		m.warned = false
+		m.execWarned = false
+		opened = true
+	} else if m.tasksFd >= 0 {
+		return
 	}
-	if !errors.Is(err, unix.ENOENT) {
+	// The loader pins the exec-path maps before the socket-owner map, so
+	// they are in place when a new socket-owner map is. They are retried
+	// on their own until they open, so that a failure to open them doesn't
+	// last as long as the socket-owner map does.
+	dir := filepath.Dir(m.path)
+	err := m.openExecMapsLocked(dir)
+	switch {
+	case err == nil:
+		log.Infoln("[Process] Using socket owners and executables recorded in %s", dir)
+		return
+	case !errors.Is(err, unix.ENOENT) && !m.execWarned:
 		log.Warnln("[Process] Can't use executables recorded in %s: %v", dir, err)
+		m.execWarned = true
 	}
-	log.Infoln("[Process] Using socket owners recorded in %s", m.path)
+	if opened {
+		log.Infoln("[Process] Using socket owners recorded in %s", m.path)
+	}
+}
+
+func (m *sockOwnerMap) openExecMapsLocked(dir string) error {
+	tasksFd, err := openBPFMap(filepath.Join(dir, execTasksMap), unix.BPF_MAP_TYPE_TASK_STORAGE, 4, execPathValue{})
+	if err != nil {
+		return err
+	}
+	recentFd, err := openBPFMap(filepath.Join(dir, execRecentMap), unix.BPF_MAP_TYPE_LRU_HASH, 4, execPathValue{})
+	if err != nil {
+		unix.Close(tasksFd)
+		return err
+	}
+	m.tasksFd, m.recentFd = tasksFd, recentFd
+	return nil
 }
 
 func (m *sockOwnerMap) warnLocked(err error) {
