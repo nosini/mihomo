@@ -679,3 +679,87 @@ func TestExecMapsRetried(t *testing.T) {
 		t.Fatalf("after fixing exec_tasks: socket-owner map open %v, exec maps open %v", connOpen, execOpen)
 	}
 }
+
+// A child that bash forks without executing sends one message and exits.
+// Once bash has reaped it, the child has no process ID to look it up by, but
+// must still be named. Over TCP, its record is saved when it connects.
+func testForkedChildReaped(t *testing.T, network string) {
+	requireExecMaps(t)
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("needs bash for /dev/" + network)
+	}
+	if bash, err = filepath.EvalSymlinks(bash); err != nil {
+		t.Fatal(err)
+	}
+	var addr net.Addr
+	var receive func() netip.AddrPort
+	buf := make([]byte, 16)
+	if network == "udp" {
+		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pc.Close()
+		addr = pc.LocalAddr()
+		receive = func() netip.AddrPort {
+			_, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return from.(*net.UDPAddr).AddrPort()
+		}
+	} else {
+		l, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		addr = l.Addr()
+		receive = func() netip.AddrPort {
+			c, err := l.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Close()
+			return c.RemoteAddr().(*net.TCPAddr).AddrPort()
+		}
+	}
+	ap := netip.MustParseAddrPort(addr.String())
+	// The subshell forks; bash prints "reaped" once it has waited for it.
+	script := fmt.Sprintf("(echo x >/dev/%s/%s/%d); echo reaped; read", network, ap.Addr(), ap.Port())
+	var bpf tally
+	for i := 0; i < rounds; i++ {
+		cmd := exec.Command(bash, "-c", script)
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		src := receive()
+		if line, _ := bufio.NewReader(stdout).ReadString('\n'); line != "reaped\n" {
+			t.Fatalf("bash: %q", line)
+		}
+		r := lookupBPF(network, src)
+		if r.err == nil && r.path != bash {
+			r.err = fmt.Errorf("named %s", r.path)
+		}
+		bpf.add(r)
+		stdin.Close()
+		cmd.Wait()
+	}
+	t.Logf("bpf: %v", &bpf)
+	if named := bpf.hits[filepath.Base(bash)]; named != bpf.n {
+		t.Errorf("forked child named in %d of %d lookups", named, bpf.n)
+	}
+}
+
+func TestExecPathForkedChildReapedUDP(t *testing.T) { testForkedChildReaped(t, "udp") }
+
+func TestExecPathForkedChildReapedTCP(t *testing.T) { testForkedChildReaped(t, "tcp") }
