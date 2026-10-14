@@ -42,6 +42,10 @@ Configuration example is located at [/docs/config.yaml](https://github.com/MetaC
 
 Documentation can be found in [mihomo Docs](https://wiki.metacubex.one/).
 
+For Linux process matching without access to other processes, see
+[socket-owner lookup](docs/socketowner.md). Its privileged loader is installed
+separately from the [socketowner repository](https://github.com/nosini/socketowner).
+
 ## For development
 
 Requirements:
