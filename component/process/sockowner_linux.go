@@ -23,6 +23,8 @@ const (
 	// soon to check again after a lookup misses, which may mean it has.
 	sockOwnerRecheck     = 30 * time.Second
 	sockOwnerMissRecheck = time.Second
+	// socketowner's map interface is versioned independently of mihomo.
+	sockOwnerABIVersion uint32 = 1
 )
 
 type sockOwnerKey struct {
@@ -39,8 +41,8 @@ type sockOwnerValue struct {
 	BootNs uint64 // CLOCK_BOOTTIME when the owner was recorded
 }
 
-// The maps of executables (execpath.c in socketowner), which the
-// loader pins next to the socket-owner map when it runs with -exec-paths:
+// The executable maps defined by socketowner ABI v1 (docs/socketowner.md). The
+// loader pins these next to the socket-owner map with -exec-paths:
 // exec_tasks holds the record of every running process and is looked up by
 // pidfd, exec_recent the last records by process ID, including processes
 // that have exited.
@@ -228,6 +230,9 @@ func (m *sockOwnerMap) warnLocked(err error) {
 }
 
 func openSockOwnerMap(path string) (int, uint64, error) {
+	if err := checkSockOwnerABI(filepath.Dir(path)); err != nil {
+		return -1, 0, err
+	}
 	netns, err := currentNetnsCookie()
 	if err != nil {
 		return -1, 0, err
@@ -237,6 +242,24 @@ func openSockOwnerMap(path string) (int, uint64, error) {
 		return -1, 0, err
 	}
 	return fd, netns, nil
+}
+
+// checkSockOwnerABI rejects absent or incompatible markers before interpreting
+// records. Map type and size checks below additionally protect lookup buffers.
+func checkSockOwnerABI(dir string) error {
+	fd, err := openBPFMap(filepath.Join(dir, "abi_version"), unix.BPF_MAP_TYPE_ARRAY, 4, uint32(0))
+	if err != nil {
+		return fmt.Errorf("socketowner ABI (install a compatible socketowner loader): %w", err)
+	}
+	defer unix.Close(fd)
+	var key, version uint32
+	if !lookupBPFMap(fd, &key, &version) {
+		return fmt.Errorf("socketowner ABI: cannot read version")
+	}
+	if version != sockOwnerABIVersion {
+		return fmt.Errorf("unsupported socketowner ABI v%d (need v%d)", version, sockOwnerABIVersion)
+	}
+	return nil
 }
 
 // openBPFMap opens the map pinned at path read-only and checks that it has

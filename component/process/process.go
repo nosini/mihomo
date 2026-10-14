@@ -19,7 +19,7 @@ const (
 )
 
 // DefaultSockOwnerMap is where the independently installed socketowner loader
-// pins the map used on Linux.
+// pins the map used on Linux. See docs/socketowner.md.
 const DefaultSockOwnerMap = "/sys/fs/bpf/mihomo/maps/conn_owners"
 
 func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, string, error) {
