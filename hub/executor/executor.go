@@ -443,6 +443,7 @@ func updateProfile(cfg *config.Config) {
 	if profileCfg.StoreSelected {
 		patchSelectGroup(cfg.Proxies)
 	}
+	updateStatistics(profileCfg.StoreStatistics)
 }
 
 func patchSelectGroup(proxies map[string]C.Proxy) {
@@ -533,6 +534,7 @@ func Shutdown() {
 	listener.Cleanup()
 	tproxy.CleanupTProxyIPTables()
 	resolver.StoreFakePoolState()
+	saveStatistics(true)
 
 	log.Warnln("Mihomo shutting down")
 }

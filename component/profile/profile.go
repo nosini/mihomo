@@ -6,3 +6,6 @@ import (
 
 // StoreSelected is a global switch for storing selected proxy to cache
 var StoreSelected = atomic.NewBool(true)
+
+// StoreStatistics is a global switch for storing connection statistics to cache
+var StoreStatistics = atomic.NewBool(false)

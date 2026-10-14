@@ -20,6 +20,7 @@ func init() {
 		uploadTotal:   atomic.NewInt64(0),
 		downloadTotal: atomic.NewInt64(0),
 		pid:           int32(os.Getpid()),
+		history:       NewHistory(),
 	}
 
 	go DefaultManager.handle()
@@ -35,6 +36,7 @@ type Manager struct {
 	downloadTotal atomic.Int64
 	pid           int32
 	memory        uint64
+	history       *History
 }
 
 func (m *Manager) Join(c Tracker) {
@@ -42,7 +44,39 @@ func (m *Manager) Join(c Tracker) {
 }
 
 func (m *Manager) Leave(c Tracker) {
-	m.connections.Delete(c.ID())
+	// Close can run more than once; only the first removal is recorded.
+	if _, loaded := m.connections.LoadAndDelete(c.ID()); loaded && counted(c) {
+		m.history.Record(c.Info())
+	}
+}
+
+// counted reports whether the tracker's traffic goes into the manager's
+// totals; inner dials of chained proxies and DNS would be counted twice.
+func counted(c Tracker) bool {
+	switch t := c.(type) {
+	case *tcpTracker:
+		return t.pushToManager
+	case *udpTracker:
+		return t.pushToManager
+	}
+	return false
+}
+
+func (m *Manager) History() *History {
+	return m.history
+}
+
+// HistoryState returns the totals of closed connections plus the current
+// counts of open ones.
+func (m *Manager) HistoryState() *HistoryState {
+	var open []*TrackerInfo
+	m.Range(func(c Tracker) bool {
+		if counted(c) {
+			open = append(open, c.Info())
+		}
+		return true
+	})
+	return m.history.State(open)
 }
 
 func (m *Manager) Get(id string) (c Tracker) {

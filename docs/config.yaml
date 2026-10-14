@@ -130,6 +130,9 @@ profile: # 存储 select 选择记录
   # 持久化 fake-ip
   store-fake-ip: true
 
+  # 持久化连接统计（按 host、进程、来源 IP、出站代理、规则汇总），通过 GET /statistics 查看
+  store-statistics: false
+
 # Tun 配置
 tun:
   enable: false
