@@ -436,17 +436,44 @@ func TestSockOwnerRejectsWrongLayout(t *testing.T) {
 	}
 	defer os.Remove(pin)
 
-	previous := SockOwnerMap()
-	SetSockOwnerMap(pin)
-	defer SetSockOwnerMap(previous)
-	if owner, ok := lookupSockOwner("udp", ap.Addr(), int(ap.Port())); ok {
-		t.Fatalf("used a map with %d-byte values: %+v", attr.ValueSize, owner)
+	if opened, err := openBPFMap(pin, unix.BPF_MAP_TYPE_LRU_HASH, attr.KeySize, sockOwnerValue{}); err == nil {
+		unix.Close(opened)
+		t.Fatal("opened a map with the wrong layout")
 	}
-	sockOwners.mu.RLock()
-	opened := sockOwners.fd >= 0
-	sockOwners.mu.RUnlock()
-	if opened {
-		t.Fatal("kept a map with the wrong layout open")
+}
+
+func TestSockOwnerABIVersion(t *testing.T) {
+	dir := fmt.Sprintf("/sys/fs/bpf/mihomo-abi-test-%d", os.Getpid())
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	if err := checkSockOwnerABI(dir); err == nil {
+		t.Fatal("accepted maps without an ABI marker")
+	}
+	for _, version := range []uint32{0, 2, sockOwnerABIVersion} {
+		t.Run(strconv.Itoa(int(version)), func(t *testing.T) {
+			attr := struct {
+				Type, KeySize, ValueSize, MaxEntries uint32
+			}{unix.BPF_MAP_TYPE_ARRAY, 4, 4, 1}
+			fd, err := bpfCall(unix.BPF_MAP_CREATE, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(int(fd))
+			var key uint32
+			if err := mapElem(unix.BPF_MAP_UPDATE_ELEM, int(fd), unsafe.Pointer(&key), unsafe.Pointer(&version)); err != nil {
+				t.Fatal(err)
+			}
+			pin := filepath.Join(dir, "abi_version")
+			if err := pinObject(int(fd), pin); err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(pin)
+			if err := checkSockOwnerABI(dir); (err == nil) != (version == sockOwnerABIVersion) {
+				t.Fatalf("ABI v%d: %v", version, err)
+			}
+		})
 	}
 }
 
@@ -640,6 +667,7 @@ func TestExecMapsRetried(t *testing.T) {
 		}
 	}
 	repin("conn_owners")
+	repin("abi_version")
 	repin(execRecentMap)
 	// A map of the wrong type stands in for exec_tasks.
 	attr := struct {
