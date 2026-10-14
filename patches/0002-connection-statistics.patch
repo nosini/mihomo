@@ -1,0 +1,170 @@
+diff --git a/component/profile/cachefile/cache.go b/component/profile/cachefile/cache.go
+index 89ce191..6091412 100644
+--- a/component/profile/cachefile/cache.go
++++ b/component/profile/cachefile/cache.go
+@@ -23,6 +23,7 @@ var (
+ 	bucketETag             = []byte("etag")
+ 	bucketSubscriptionInfo = []byte("subscriptioninfo")
+ 	bucketStorage          = []byte("storage")
++	bucketStatistics       = []byte("statistics")
+ )
+ 
+ // CacheFile store and update the cache file
+diff --git a/component/profile/profile.go b/component/profile/profile.go
+index 36db8cc..ffa9f04 100644
+--- a/component/profile/profile.go
++++ b/component/profile/profile.go
+@@ -6,3 +6,6 @@ import (
+ 
+ // StoreSelected is a global switch for storing selected proxy to cache
+ var StoreSelected = atomic.NewBool(true)
++
++// StoreStatistics is a global switch for storing connection statistics to cache
++var StoreStatistics = atomic.NewBool(false)
+diff --git a/config/config.go b/config/config.go
+index 106e90d..22f9042 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -179,8 +179,9 @@ type DNS struct {
+ 
+ // Profile config
+ type Profile struct {
+-	StoreSelected bool
+-	StoreFakeIP   bool
++	StoreSelected   bool
++	StoreFakeIP     bool
++	StoreStatistics bool
+ }
+ 
+ // TLS config
+@@ -362,8 +363,9 @@ type RawExperimental struct {
+ }
+ 
+ type RawProfile struct {
+-	StoreSelected bool `yaml:"store-selected" json:"store-selected"`
+-	StoreFakeIP   bool `yaml:"store-fake-ip" json:"store-fake-ip"`
++	StoreSelected   bool `yaml:"store-selected" json:"store-selected"`
++	StoreFakeIP     bool `yaml:"store-fake-ip" json:"store-fake-ip"`
++	StoreStatistics bool `yaml:"store-statistics" json:"store-statistics"`
+ }
+ 
+ type RawGeoXUrl struct {
+@@ -867,8 +869,9 @@ func parseNTP(cfg *RawConfig) (*NTP, error) {
+ 
+ func parseProfile(cfg *RawConfig) (*Profile, error) {
+ 	return &Profile{
+-		StoreSelected: cfg.Profile.StoreSelected,
+-		StoreFakeIP:   cfg.Profile.StoreFakeIP,
++		StoreSelected:   cfg.Profile.StoreSelected,
++		StoreFakeIP:     cfg.Profile.StoreFakeIP,
++		StoreStatistics: cfg.Profile.StoreStatistics,
+ 	}, nil
+ }
+ 
+diff --git a/docs/config.yaml b/docs/config.yaml
+index 9f40f75..3398b57 100644
+--- a/docs/config.yaml
++++ b/docs/config.yaml
+@@ -145,6 +145,9 @@ profile: # 存储 select 选择记录
+   # 持久化 fake-ip
+   store-fake-ip: true
+ 
++  # 持久化连接统计（按 host、进程、来源 IP、出站代理、规则汇总），通过 GET /statistics 查看
++  store-statistics: false
++
+ # Tun 配置
+ tun:
+   enable: false
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index 49044fe..eb011b6 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -448,6 +448,7 @@ func updateProfile(cfg *config.Config) {
+ 	if profileCfg.StoreSelected {
+ 		patchSelectGroup(cfg.Proxies)
+ 	}
++	updateStatistics(profileCfg.StoreStatistics)
+ }
+ 
+ func patchSelectGroup(proxies map[string]C.Proxy) {
+@@ -538,6 +539,7 @@ func Shutdown() {
+ 	listener.Cleanup()
+ 	tproxy.CleanupTProxyIPTables()
+ 	resolver.StoreFakePoolState()
++	saveStatistics(true)
+ 
+ 	log.Warnln("Mihomo shutting down")
+ }
+diff --git a/hub/route/server.go b/hub/route/server.go
+index 6d37d48..10e1420 100644
+--- a/hub/route/server.go
++++ b/hub/route/server.go
+@@ -130,6 +130,7 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
+ 		r.Mount("/group", groupRouter())
+ 		r.Mount("/rules", ruleRouter())
+ 		r.Mount("/connections", connectionRouter())
++		r.Mount("/statistics", statisticsRouter())
+ 		r.Mount("/providers/proxies", proxyProviderRouter())
+ 		r.Mount("/providers/rules", ruleProviderRouter())
+ 		r.Mount("/cache", cacheRouter())
+diff --git a/tunnel/statistic/manager.go b/tunnel/statistic/manager.go
+index c69746d..dfc2186 100644
+--- a/tunnel/statistic/manager.go
++++ b/tunnel/statistic/manager.go
+@@ -20,6 +20,7 @@ func init() {
+ 		uploadTotal:   atomic.NewInt64(0),
+ 		downloadTotal: atomic.NewInt64(0),
+ 		pid:           int32(os.Getpid()),
++		history:       NewHistory(),
+ 	}
+ 
+ 	go DefaultManager.handle()
+@@ -35,6 +36,7 @@ type Manager struct {
+ 	downloadTotal atomic.Int64
+ 	pid           int32
+ 	memory        uint64
++	history       *History
+ }
+ 
+ func (m *Manager) Join(c Tracker) {
+@@ -42,7 +44,39 @@ func (m *Manager) Join(c Tracker) {
+ }
+ 
+ func (m *Manager) Leave(c Tracker) {
+-	m.connections.Delete(c.ID())
++	// Close can run more than once; only the first removal is recorded.
++	if _, loaded := m.connections.LoadAndDelete(c.ID()); loaded && counted(c) {
++		m.history.Record(c.Info())
++	}
++}
++
++// counted reports whether the tracker's traffic goes into the manager's
++// totals; inner dials of chained proxies and DNS would be counted twice.
++func counted(c Tracker) bool {
++	switch t := c.(type) {
++	case *tcpTracker:
++		return t.pushToManager
++	case *udpTracker:
++		return t.pushToManager
++	}
++	return false
++}
++
++func (m *Manager) History() *History {
++	return m.history
++}
++
++// HistoryState returns the totals of closed connections plus the current
++// counts of open ones.
++func (m *Manager) HistoryState() *HistoryState {
++	var open []*TrackerInfo
++	m.Range(func(c Tracker) bool {
++		if counted(c) {
++			open = append(open, c.Info())
++		}
++		return true
++	})
++	return m.history.State(open)
+ }
+ 
+ func (m *Manager) Get(id string) (c Tracker) {
