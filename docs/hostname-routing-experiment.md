@@ -7,10 +7,11 @@ supervising VM test. There is no production hostname configuration or reader.
 
 The supervisor owns all BPF state and supplies validated lookup results over an
 inherited Unix socket. A test-only tunnel wrapper waits at most one absolute
-250 ms budget before handing the connection to Mihomo. A rule wrapper evaluates
-the resulting name using a metadata clone, preserving the original dial IP and
-port. This isolates timing and destination behavior while leaving production
-provenance, precedence and observer authority undecided.
+250 ms budget before handing the connection to Mihomo. It supplies a validated
+ordinary TLS name through the internal application-hostname metadata. The normal
+`RuleHost()` and DOMAIN matcher select the route while preserving the original
+dial IP and port. [Metadata semantics](application-hostname-metadata.md) define
+provenance and precedence; production reader authority remains separate work.
 
 The matrix covers IPv4/IPv6 and process lookup `off`/`always`. It demonstrates
 that current routing can choose its outbound before ClientHello: the background
@@ -18,7 +19,9 @@ that current routing can choose its outbound before ClientHello: the background
 named outbound for early evidence and fallback for late/missing evidence, stopped
 observers, stalled requests and positive replies arriving after the deadline.
 Each case verifies the real dial and ClientHello relay to the original IP/port,
-and rejects a second dial after commitment.
+and rejects a second dial after commitment. The expanded matrix has 32 cases,
+including TLS sniffing with destination replacement enabled and conflicting DNS
+hints/hosts entries. Both test binaries pass with Go's race detector.
 
 Build the helper from this checkout:
 
@@ -33,7 +36,10 @@ and supported profile. Running this helper directly without the supervisor skips
 the test. Ordinary Mihomo builds exclude the helper entirely.
 
 The tests use an isolated network namespace and redirect only the client's
-private cgroup. They explicitly enable IPv6 and disable sniffing. The peer stops
-after reading ClientHello. Full TLS/certificate validation, Fake-IP/sniffer
-precedence, encrypted DNS, ECH, browser support, independent observer crash safety,
-a versioned ABI and least-privilege deployment remain unverified.
+private cgroup. They explicitly enable IPv6; sniffing runs only in its dedicated
+case. The peer stops after reading ClientHello. Full TLS/certificate validation,
+end-to-end Fake-IP, encrypted DNS, ECH and browser support remain unverified.
+Separate socketowner experiments exercise observer crash safety and authenticated
+bootstrap, but have not yet been connected to this routing consumer. A versioned
+reader interface, final-consumption authority and least-privilege deployment
+remain open.

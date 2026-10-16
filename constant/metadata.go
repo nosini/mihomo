@@ -216,7 +216,8 @@ type Metadata struct {
 	RawSrcAddr net.Addr `json:"-"`
 	RawDstAddr net.Addr `json:"-"`
 	// Only domain rule
-	SniffHost string `json:"sniffHost"`
+	SniffHost           string `json:"sniffHost"`
+	applicationHostname *applicationHostname
 }
 
 func (m *Metadata) RemoteAddress() string {
@@ -268,6 +269,9 @@ func (m *Metadata) Resolved() bool {
 }
 
 func (m *Metadata) RuleHost() string {
+	if host := m.ApplicationHostname(); host != "" {
+		return host
+	}
 	if len(m.SniffHost) == 0 {
 		return m.Host
 	} else {
@@ -278,7 +282,7 @@ func (m *Metadata) RuleHost() string {
 // Pure is used to solve unexpected behavior
 // when dialing proxy connection in DNSMapping mode.
 func (m *Metadata) Pure() *Metadata {
-	if (m.DNSMode == DNSMapping || m.DNSMode == DNSHosts) && m.DstIP.IsValid() {
+	if ((m.DNSMode == DNSMapping || m.DNSMode == DNSHosts) && m.DstIP.IsValid()) || m.ApplicationHostname() != "" {
 		copyM := *m
 		copyM.Host = ""
 		return &copyM

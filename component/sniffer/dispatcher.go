@@ -168,6 +168,11 @@ func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool 
 
 func replaceDomain(metadata *C.Metadata, host string, overrideDest bool) {
 	metadata.SniffHost = host
+	if metadata.ApplicationHostname() != "" {
+		// A usable application association supplies only a routing name. Keep
+		// the real destination and DNS provenance, even with override enabled.
+		return
+	}
 	if overrideDest {
 		log.Debugln("[Sniffer] Sniff %s [%s]-->[%s] success, replace domain [%s]-->[%s]",
 			metadata.NetWork,

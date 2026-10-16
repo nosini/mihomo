@@ -297,11 +297,14 @@ func preHandleMetadata(metadata *C.Metadata) error {
 				// only clear dstIP if it is confirmed to be a fake IP
 				metadata.DstIP = netip.Addr{}
 				metadata.DNSMode = C.DNSFakeIP
-			} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
-				// redir-host should lookup the hosts
-				metadata.DstIP, _ = node.RandIP()
-			} else if node != nil && node.IsDomain {
-				metadata.Host = node.Domain
+			} else if metadata.ApplicationHostname() == "" {
+				// A connection-bound application name preserves the real IP.
+				// Other redir-host connections still consult hosts overrides.
+				if node, ok := resolver.DefaultHosts.Search(host, false); ok {
+					metadata.DstIP, _ = node.RandIP()
+				} else if node != nil && node.IsDomain {
+					metadata.Host = node.Domain
+				}
 			}
 		} else if resolver.IsFakeIP(metadata.DstIP) {
 			return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
@@ -328,9 +331,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		attemptProcessLookup = metadata.Type != C.INNER
 	)
 
-	if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
-		metadata.DstIP, _ = node.RandIP()
-		resolved = true
+	if metadata.ApplicationHostname() == "" {
+		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
+			metadata.DstIP, _ = node.RandIP()
+			resolved = true
+		}
 	}
 
 	helper := C.RuleMatchHelper{
@@ -558,7 +563,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 
 	dialMetadata := metadata
-	if len(metadata.Host) > 0 {
+	if len(metadata.Host) > 0 && metadata.ApplicationHostname() == "" {
 		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
 			if dstIp, _ := node.RandIP(); !resolver.IsFakeIP(dstIp) {
 				dialMetadata.DstIP = dstIp
@@ -566,6 +571,9 @@ func handleTCPConn(connCtx C.ConnContext) {
 				dialMetadata = dialMetadata.Pure()
 			}
 		}
+	}
+	if metadata.ApplicationHostname() != "" {
+		dialMetadata = dialMetadata.Pure()
 	}
 
 	var peekBytes []byte

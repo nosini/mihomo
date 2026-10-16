@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"sync"
@@ -19,9 +20,12 @@ import (
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
+	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
+	S "github.com/metacubex/mihomo/constant/sniffer"
 	"github.com/metacubex/mihomo/listener/redir"
 	"github.com/metacubex/mihomo/log"
 	R "github.com/metacubex/mihomo/rules/common"
@@ -30,14 +34,22 @@ import (
 )
 
 type hostnameVMEvent struct {
-	Kind, Address, Source, Local, Original, Name, Proxy, Host string
-	Netns, Cookie                                             uint64
-	ElapsedNS                                                 int64
+	Kind, Address, Source, Local, Original, Name, Proxy, Host, RuleHost, SniffHost string
+	Netns, Cookie                                                                  uint64
+	ElapsedNS                                                                      int64
 }
 
 type hostnameVMReply struct {
 	Name string
 }
+
+// This hint deliberately conflicts with both the verified application name
+// and a hosts entry. Production preprocessing must not turn it into a new dial.
+type hostnameVMMapper struct{ resolver.Enhancer }
+
+func (hostnameVMMapper) MappingEnabled() bool                   { return true }
+func (hostnameVMMapper) IsFakeIP(netip.Addr) bool               { return false }
+func (hostnameVMMapper) FindHostByIP(netip.Addr) (string, bool) { return "hint.invalid", true }
 
 type hostnameVMControl struct {
 	conn net.Conn
@@ -67,23 +79,6 @@ func (c *hostnameVMControl) exchange(e hostnameVMEvent, deadline time.Time) (hos
 	return reply, err
 }
 
-// Keep experiment evidence separate from Host/SniffHost and expose it only to
-// this ordinary DOMAIN rule's cloned metadata. The original dial metadata is
-// never changed. Production provenance and precedence remain to be designed.
-type hostnameVMRule struct {
-	C.Rule
-	name *string
-}
-
-func (r hostnameVMRule) Match(m *C.Metadata, h C.RuleMatchHelper) (bool, string) {
-	if *r.name == "" {
-		return false, r.Adapter()
-	}
-	copy := m.Clone()
-	copy.Host, copy.SniffHost = *r.name, ""
-	return r.Rule.Match(copy, h)
-}
-
 type hostnameVMProxy struct {
 	*outbound.Direct
 	control *hostnameVMControl
@@ -91,7 +86,7 @@ type hostnameVMProxy struct {
 }
 
 func (p *hostnameVMProxy) DialContext(ctx context.Context, m *C.Metadata) (C.Conn, error) {
-	if err := p.control.event(hostnameVMEvent{Kind: "dial", Proxy: p.Name(), Original: m.RemoteAddress(), Host: m.Host, ElapsedNS: time.Since(*p.start).Nanoseconds()}); err != nil {
+	if err := p.control.event(hostnameVMEvent{Kind: "dial", Proxy: p.Name(), Original: m.RemoteAddress(), Host: m.Host, RuleHost: m.RuleHost(), SniffHost: m.SniffHost, ElapsedNS: time.Since(*p.start).Nanoseconds()}); err != nil {
 		return nil, err
 	}
 	conn, err := p.Direct.DialContext(ctx, m)
@@ -108,7 +103,6 @@ type hostnameVMTunnel struct {
 	C.Tunnel
 	control *hostnameVMControl
 	budget  time.Duration
-	name    *string
 	start   *time.Time
 	done    chan struct{}
 }
@@ -143,7 +137,9 @@ func (h *hostnameVMTunnel) HandleTCPConn(conn net.Conn, m *C.Metadata) {
 			break // unknown on failure or a response outside the budget
 		}
 		if reply.Name != "" {
-			*h.name = reply.Name
+			// The supervisor supplies a live, guarded TLS observation. The real
+			// RuleHost path consumes it; no rule wrapper or Host rewrite is used.
+			_ = m.SetApplicationHostname(reply.Name, C.ApplicationHostnameTLS)
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -173,8 +169,21 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 	}
 	log.SetLevel(log.SILENT)
 	resolver.DisableIPv6 = false
+	switch os.Getenv("HOSTNAME_VM_ROUTE_POLICY") {
+	case "sniff":
+		dispatcher, err := sniffer.NewDispatcher(&sniffer.Config{Enable: true, ParsePureIp: true,
+			Sniffers: map[S.Type]sniffer.SnifferConfig{S.TLS: {OverrideDest: true, Ports: utils.IntRanges[uint16]{utils.NewRange[uint16](1, 65535)}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		T.UpdateSniffer(dispatcher)
+	case "mapping-hosts":
+		resolver.DefaultHostMapper = hostnameVMMapper{}
+		wrong, _ := resolver.NewHostValue([]string{"127.0.0.2"})
+		resolver.DefaultHosts.Insert("hint.invalid", wrong)
+		resolver.DefaultHosts.Insert("route.invalid", wrong)
+	}
 	T.OnRunning()
-	var name string
 	var start time.Time
 	proxies := make(map[string]C.Proxy)
 	for _, name := range []string{"NAMED", "DIRECT"} {
@@ -182,8 +191,8 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 		proxies[name] = adapter.NewProxy(p)
 	}
 	T.UpdateProxies(proxies, nil)
-	T.UpdateRules([]C.Rule{hostnameVMRule{Rule: R.NewDomain("route.invalid", "NAMED"), name: &name}}, nil, nil)
-	h := &hostnameVMTunnel{Tunnel: T.Tunnel, control: control, budget: time.Duration(budget) * time.Millisecond, name: &name, start: &start, done: make(chan struct{})}
+	T.UpdateRules([]C.Rule{R.NewDomain("route.invalid", "NAMED")}, nil, nil)
+	h := &hostnameVMTunnel{Tunnel: T.Tunnel, control: control, budget: time.Duration(budget) * time.Millisecond, start: &start, done: make(chan struct{})}
 	listener, err := redir.New(os.Getenv("HOSTNAME_VM_ROUTE_LISTEN"), h)
 	if err != nil {
 		t.Fatal(err)
