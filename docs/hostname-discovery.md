@@ -6,7 +6,12 @@ does not depend on `find-process-mode`. The separately versioned reader is
 included only in Linux amd64 builds with `hostname_discovery`; ordinary builds
 reject an enabled configuration instead of silently accepting it.
 
-This remains an experimental feature. The observer is socketowner's separate
+This remains an experimental feature. The current observer supports an exact
+OpenSSL socket-BIO/send path, not every application using that library. Real
+curl 8.22.0/OpenSSL 3.5.3 custom-BIO traffic remains unattributed and uses ordinary
+fallback, as verified through confined TUN and local auto-redirect for both IP
+families and TLS versions. HTTPS verification still works, but hostname DOMAIN
+rules do not gain curl attribution from this profile. The observer is socketowner's separate
 [`mihomo-hostname-observer`](../../socketowner/experiments/hostname/OBSERVER.md)
 command; the existing `socketowner attach` command does not start it.
 The [optional hostname contract v1](../../socketowner/docs/hostname-interface.md)
