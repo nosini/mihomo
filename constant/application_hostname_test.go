@@ -40,7 +40,7 @@ func TestApplicationHostnameSelection(t *testing.T) {
 			if role == 0 {
 				role = C.ApplicationHostnameTLS
 			}
-			if err := m.SetApplicationHostname("Route.Invalid.", role); err != nil {
+			if err := setApplicationHostname(m, "Route.Invalid.", role); err != nil {
 				t.Fatal(err)
 			}
 			m.Host, m.SniffHost, m.DNSMode = tc.host, tc.sniff, tc.mode
@@ -59,19 +59,19 @@ func TestApplicationHostnameValidation(t *testing.T) {
 	for _, name := range []string{"", ".", "a..b", "name..", "-name.invalid", "name-.invalid", "name_1.invalid", "*.invalid", "a/b", "a:443", "a\x00b", " a.invalid", "a.invalid\n", "é.invalid", "127.0.0.1", "::1", strings.Repeat("a", 64) + ".invalid", strings.Repeat("a.", 127) + "a"} {
 		t.Run(name, func(t *testing.T) {
 			m := applicationMetadata()
-			if err := m.SetApplicationHostname(name, C.ApplicationHostnameTLS); err == nil || m.RuleHost() != "" {
+			if err := setApplicationHostname(m, name, C.ApplicationHostnameTLS); err == nil || m.RuleHost() != "" {
 				t.Fatalf("accepted %q", name)
 			}
 		})
 	}
 	for _, name := range []string{"a", "xn--bcher-kva.invalid", strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61) + "."} {
 		m := applicationMetadata()
-		if err := m.SetApplicationHostname(name, C.ApplicationHostnameTLS); err != nil {
+		if err := setApplicationHostname(m, name, C.ApplicationHostnameTLS); err != nil {
 			t.Fatalf("rejected %q: %v", name, err)
 		}
 	}
 	m := applicationMetadata()
-	if err := m.SetApplicationHostname("route.invalid", 0); err == nil {
+	if err := setApplicationHostname(m, "route.invalid", 0); err == nil {
 		t.Fatal("accepted unspecified provenance")
 	}
 }
@@ -86,7 +86,7 @@ func TestApplicationHostnameScopeAndConflict(t *testing.T) {
 		func(m *C.Metadata) { m.DstPort++ },
 	} {
 		m := applicationMetadata()
-		if err := m.SetApplicationHostname("route.invalid", C.ApplicationHostnameTLS); err != nil {
+		if err := setApplicationHostname(m, "route.invalid", C.ApplicationHostnameTLS); err != nil {
 			t.Fatal(err)
 		}
 		clone := m.Clone()
@@ -100,11 +100,11 @@ func TestApplicationHostnameScopeAndConflict(t *testing.T) {
 	}
 	for _, replacement := range []string{"other.invalid", "bad name"} {
 		m := applicationMetadata()
-		m.SetApplicationHostname("route.invalid", C.ApplicationHostnameTLS)
-		if err := m.SetApplicationHostname(replacement, C.ApplicationHostnameTLS); err == nil {
+		setApplicationHostname(m, "route.invalid", C.ApplicationHostnameTLS)
+		if err := setApplicationHostname(m, replacement, C.ApplicationHostnameTLS); err == nil {
 			t.Fatal("accepted conflicting replacement")
 		}
-		if err := m.SetApplicationHostname("route.invalid", C.ApplicationHostnameTLS); err == nil || m.ApplicationHostname() != "" {
+		if err := setApplicationHostname(m, "route.invalid", C.ApplicationHostnameTLS); err == nil || m.ApplicationHostname() != "" {
 			t.Fatal("conflict healed")
 		}
 	}
@@ -114,7 +114,7 @@ func TestApplicationHostnameDoesNotBecomeDialAddress(t *testing.T) {
 	for _, address := range []string{"192.0.2.20", "2001:db8::20"} {
 		m := applicationMetadata()
 		m.DstIP = netip.MustParseAddr(address)
-		m.SetApplicationHostname("route.invalid", C.ApplicationHostnameTLS)
+		setApplicationHostname(m, "route.invalid", C.ApplicationHostnameTLS)
 		m.Host, m.DNSMode = "hint.invalid", C.DNSMapping
 		pure := m.Pure()
 		if pure.Host != "" || pure.DstIP != m.DstIP || pure.DstPort != 443 || pure.RuleHost() != "route.invalid" {
@@ -133,5 +133,33 @@ func TestApplicationHostnameDoesNotBecomeDialAddress(t *testing.T) {
 		if m.Host != "hint.invalid" {
 			t.Fatal("Pure mutated original")
 		}
+	}
+}
+
+func setApplicationHostname(m *C.Metadata, name string, role C.ApplicationHostnameRole) error {
+	return m.SetApplicationHostname(name, role, func() bool { return true })
+}
+
+func TestApplicationHostnameRequiresFreshAuthority(t *testing.T) {
+	m := applicationMetadata()
+	if err := m.SetApplicationHostname("route.invalid", C.ApplicationHostnameTLS, nil); err == nil {
+		t.Fatal("accepted an unguarded name")
+	}
+	m = applicationMetadata()
+	valid := true
+	if err := m.SetApplicationHostname("route.invalid", C.ApplicationHostnameTLS, func() bool { return valid }); err != nil {
+		t.Fatal(err)
+	}
+	clone := m.Clone()
+	valid = false
+	if err := m.SetApplicationHostname("route.invalid", C.ApplicationHostnameTLS, func() bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	if m.ConfirmApplicationHostname() || clone.ConfirmApplicationHostname() {
+		t.Fatal("a copied or repeated name replaced its original authority")
+	}
+	valid = true
+	if m.ConfirmApplicationHostname() || m.ApplicationHostname() != "" {
+		t.Fatal("failed consumption healed")
 	}
 }

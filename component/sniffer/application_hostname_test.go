@@ -27,7 +27,7 @@ func TestApplicationHostnameDestinationPolicy(t *testing.T) {
 					DstIP: netip.MustParseAddr("192.0.2.20"), DstPort: 443}
 				original := m.DstIP
 				if tc.observed != "" {
-					if err := m.SetApplicationHostname(tc.observed, tc.role); err != nil {
+					if err := m.SetApplicationHostname(tc.observed, tc.role, func() bool { return true }); err != nil {
 						t.Fatal(err)
 					}
 				}

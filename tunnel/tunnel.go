@@ -504,6 +504,60 @@ func handleUDPConn(packet C.PacketAdapter) {
 	sender.Send(packet) // nonblocking
 }
 
+var errTCPMetadataPreprocess = errors.New("metadata preprocessing failed")
+
+// prepareTCPMetadata retains the normal DNS/Fake-IP and sniffer policy.
+func prepareTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata) error {
+	preHandleFailed := false
+	if err := preHandleMetadata(metadata); err != nil {
+		log.Debugln("[Metadata PreHandle] error: %s", err)
+		preHandleFailed = true
+	}
+
+	conn.ResetPeeked() // reset before sniffer
+	if sniffingEnable && snifferDispatcher.Enable() {
+		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
+		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
+		if snifferDispatcher.TCPSniff(conn, metadata) {
+			// we now have a domain name
+			preHandleFailed = false
+		}
+	}
+
+	// If both trials have failed, we can do nothing but give up
+	if preHandleFailed {
+		log.Debugln("[Metadata PreHandle] failed to sniff a domain for connection %s --> %s, give up",
+			metadata.SourceDetail(), metadata.RemoteAddress())
+		return errTCPMetadataPreprocess
+	}
+
+	return nil
+}
+
+// A tentative application route has no outbound side effects. Only a fresh
+// post-match validation commits it. On failure, rebuild normal metadata from
+// the original image and select once without application evidence.
+func resolveTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata, beforeResolve func()) (C.Proxy, C.Rule, error) {
+	if metadata.HasApplicationHostname() {
+		fallback := metadata.WithoutApplicationHostname()
+		if metadata.ApplicationHostname() != "" {
+			if err := prepareTCPMetadata(conn, metadata); err == nil && metadata.ApplicationHostname() != "" {
+				proxy, rule, err := resolveMetadata(metadata)
+				if err == nil && metadata.ConfirmApplicationHostname() {
+					beforeResolve()
+					return proxy, rule, nil
+				}
+			}
+		}
+		*metadata = *fallback
+	}
+	if err := prepareTCPMetadata(conn, metadata); err != nil {
+		return nil, nil, err
+	}
+	beforeResolve()
+	return resolveMetadata(metadata)
+}
+
 func handleTCPConn(connCtx C.ConnContext) {
 	if !isHandle(connCtx.Metadata().Type) {
 		_ = connCtx.Conn().Close()
@@ -521,44 +575,26 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
-	preHandleFailed := false
-	if err := preHandleMetadata(metadata); err != nil {
-		log.Debugln("[Metadata PreHandle] error: %s", err)
-		preHandleFailed = true
-	}
-
 	conn := connCtx.Conn()
-	conn.ResetPeeked() // reset before sniffer
-	if sniffingEnable && snifferDispatcher.Enable() {
-		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
-		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
-		if snifferDispatcher.TCPSniff(conn, metadata) {
-			// we now have a domain name
-			preHandleFailed = false
+
+	peekMutex := sync.Mutex{}
+	startPeek := func() {
+		if !conn.Peeked() {
+			peekMutex.Lock()
+			go func() {
+				defer peekMutex.Unlock()
+				_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+				_, _ = conn.Peek(1)
+				_ = conn.SetReadDeadline(time.Time{})
+			}()
 		}
 	}
 
-	// If both trials have failed, we can do nothing but give up
-	if preHandleFailed {
-		log.Debugln("[Metadata PreHandle] failed to sniff a domain for connection %s --> %s, give up",
-			metadata.SourceDetail(), metadata.RemoteAddress())
-		return
-	}
-
-	peekMutex := sync.Mutex{}
-	if !conn.Peeked() {
-		peekMutex.Lock()
-		go func() {
-			defer peekMutex.Unlock()
-			_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-			_, _ = conn.Peek(1)
-			_ = conn.SetReadDeadline(time.Time{})
-		}()
-	}
-
-	proxy, rule, err := resolveMetadata(metadata)
+	proxy, rule, err := resolveTCPMetadata(conn, metadata, startPeek)
 	if err != nil {
-		log.Warnln("[Metadata] parse failed: %s", err.Error())
+		if !errors.Is(err, errTCPMetadataPreprocess) {
+			log.Warnln("[Metadata] parse failed: %s", err.Error())
+		}
 		return
 	}
 

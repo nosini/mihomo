@@ -7,6 +7,7 @@ package tunnel_test
 // owns all BPF maps and links. This is not an external hostname service ABI.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -40,7 +41,37 @@ type hostnameVMEvent struct {
 }
 
 type hostnameVMReply struct {
-	Name string
+	Name  string
+	Close bool
+}
+
+// Filled only by the extra hostname_reader_vm test build in a two-module Go
+// workspace. Ordinary builds and the original supervised helper need no new
+// module dependency and have no experimental map consumer.
+type hostnameVMReader interface {
+	Lookup(uint64, netip.AddrPort, netip.AddrPort, time.Time) (string, func() bool, error)
+	Close()
+}
+
+var hostnameVMOpenReader func(string, time.Time) (hostnameVMReader, error)
+
+type hostnameVMBarrierRule struct {
+	C.Rule
+	control *hostnameVMControl
+	reader  hostnameVMReader
+	once    bool
+}
+
+func (r *hostnameVMBarrierRule) Match(m *C.Metadata, helper C.RuleMatchHelper) (bool, string) {
+	matched, adapter := r.Rule.Match(m, helper)
+	if matched && !r.once {
+		r.once = true
+		reply, err := r.control.exchange(hostnameVMEvent{Kind: "matched", Name: m.RuleHost()}, time.Now().Add(5*time.Second))
+		if err != nil || reply.Close {
+			r.reader.Close()
+		}
+	}
+	return matched, adapter
 }
 
 // This hint deliberately conflicts with both the verified application name
@@ -104,6 +135,7 @@ type hostnameVMTunnel struct {
 	control *hostnameVMControl
 	budget  time.Duration
 	start   *time.Time
+	reader  hostnameVMReader
 	done    chan struct{}
 }
 
@@ -132,14 +164,25 @@ func (h *hostnameVMTunnel) HandleTCPConn(conn net.Conn, m *C.Metadata) {
 	*h.start = time.Now()
 	deadline := h.start.Add(h.budget)
 	for h.budget > 0 && time.Now().Before(deadline) {
+		if h.reader != nil {
+			name, validate, err := h.reader.Lookup(e.Netns, netip.MustParseAddrPort(e.Source), netip.MustParseAddrPort(e.Local), deadline)
+			if err == nil && name != "" {
+				_ = m.SetApplicationHostname(name, C.ApplicationHostnameTLS, validate)
+				break
+			}
+		}
 		reply, err := h.control.exchange(hostnameVMEvent{Kind: "lookup"}, deadline)
 		if err != nil || !time.Now().Before(deadline) {
 			break // unknown on failure or a response outside the budget
 		}
-		if reply.Name != "" {
+		if h.reader == nil && reply.Name != "" {
 			// The supervisor supplies a live, guarded TLS observation. The real
 			// RuleHost path consumes it; no rule wrapper or Host rewrite is used.
-			_ = m.SetApplicationHostname(reply.Name, C.ApplicationHostnameTLS)
+			name := reply.Name
+			_ = m.SetApplicationHostname(name, C.ApplicationHostnameTLS, func() bool {
+				fresh, err := h.control.exchange(hostnameVMEvent{Kind: "validate"}, deadline)
+				return err == nil && fresh.Name == name && time.Now().Before(deadline)
+			})
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -159,6 +202,24 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 	}
 	defer conn.Close()
 	control := &hostnameVMControl{conn: conn, enc: json.NewEncoder(conn), dec: json.NewDecoder(conn)}
+	var reader hostnameVMReader
+	if endpoint := os.Getenv("HOSTNAME_VM_ROUTE_ENDPOINT"); endpoint != "" {
+		status, err := os.ReadFile("/proc/self/status")
+		if err != nil || os.Geteuid() != 1000 || !bytes.Contains(status, []byte("CapEff:\t0000000000000000")) {
+			t.Fatal("Mihomo reader must be capability-free UID 1000")
+		}
+		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		if hostnameVMOpenReader == nil {
+			t.Fatal("build this helper with hostname_reader_vm in the two-module workspace")
+		}
+		reader, err = hostnameVMOpenReader(endpoint, time.Now().Add(time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reader.Close()
+	}
 	budget, err := strconv.Atoi(os.Getenv("HOSTNAME_VM_ROUTE_BUDGET_MS"))
 	if err != nil || budget < 0 || budget > 1000 {
 		t.Fatal("invalid experiment budget")
@@ -191,8 +252,12 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 		proxies[name] = adapter.NewProxy(p)
 	}
 	T.UpdateProxies(proxies, nil)
-	T.UpdateRules([]C.Rule{R.NewDomain("route.invalid", "NAMED")}, nil, nil)
-	h := &hostnameVMTunnel{Tunnel: T.Tunnel, control: control, budget: time.Duration(budget) * time.Millisecond, start: &start, done: make(chan struct{})}
+	var rule C.Rule = R.NewDomain("route.invalid", "NAMED")
+	if reader != nil {
+		rule = &hostnameVMBarrierRule{Rule: rule, control: control, reader: reader}
+	}
+	T.UpdateRules([]C.Rule{rule}, nil, nil)
+	h := &hostnameVMTunnel{Tunnel: T.Tunnel, control: control, budget: time.Duration(budget) * time.Millisecond, start: &start, reader: reader, done: make(chan struct{})}
 	listener, err := redir.New(os.Getenv("HOSTNAME_VM_ROUTE_LISTEN"), h)
 	if err != nil {
 		t.Fatal(err)

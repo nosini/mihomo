@@ -11,7 +11,8 @@ inherited Unix socket. A test-only tunnel wrapper waits at most one absolute
 ordinary TLS name through the internal application-hostname metadata. The normal
 `RuleHost()` and DOMAIN matcher select the route while preserving the original
 dial IP and port. [Metadata semantics](application-hostname-metadata.md) define
-provenance and precedence; production reader authority remains separate work.
+provenance and precedence. The extra direct-reader companion described below
+adds final-consumption authority checks; production configuration remains open.
 
 The matrix covers IPv4/IPv6 and process lookup `off`/`always`. It demonstrates
 that current routing can choose its outbound before ClientHello: the background
@@ -39,7 +40,11 @@ The tests use an isolated network namespace and redirect only the client's
 private cgroup. They explicitly enable IPv6; sniffing runs only in its dedicated
 case. The peer stops after reading ClientHello. Full TLS/certificate validation,
 end-to-end Fake-IP, encrypted DNS, ECH and browser support remain unverified.
-Separate socketowner experiments exercise observer crash safety and authenticated
-bootstrap, but have not yet been connected to this routing consumer. A versioned
-reader interface, final-consumption authority and least-privilege deployment
-remain open.
+The extra `hostname_reader_vm` build now bootstraps socketowner's authenticated
+reader directly in capability-free Mihomo. Its 36-case matrix adds post-match
+validation, rollback before dialing and fixed routes after commitment. It uses a
+temporary Go workspace containing both repositories, with no production module
+dependency. See [CONSUMPTION.md](../../socketowner/experiments/hostname/CONSUMPTION.md)
+for the build, budgets and tested failure points. Both routing matrices pass
+together under the race detector. A stable versioned reader interface, an
+operator enable/wait entry point and service confinement remain open.

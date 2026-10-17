@@ -11,7 +11,8 @@ The socketowner diagnostic maps and bootstrap remain experimental.
 
 ## Association and provenance
 
-`SetApplicationHostname` takes a reader-validated name and an explicit role:
+`SetApplicationHostname` takes a reader-validated name, a required fresh-validation
+callback and an explicit role:
 
 - `ApplicationHostnameTLS`: a supported adapter verified the ordinary TLS name.
 - `ApplicationHostnameECHInner`: an adapter verified the intended ECH inner
@@ -34,9 +35,20 @@ replacement, permanently exclude application evidence on that metadata.
 
 These local checks do not prove socket identity, observer liveness or publisher
 authority. The reader must establish those and validate freshness at route
-commitment. A copied name is not a durable authority token. The private VM
-supervisor keeps ownership through route selection; independent bootstrap and
-authority experiments have not yet been connected to this routing consumer.
+commitment. A copied name is not a durable authority token. The extra
+`hostname_reader_vm` companion now connects the authenticated socketowner reader
+directly to capability-free Mihomo and rechecks its candidate after rule matching.
+The final guarded read is the commitment point; it does not grant an authority
+lease covering subsequent process/kernel events or the outbound handshake.
+
+If preparation or confirmation fails, source selection rejects the candidate,
+or route evaluation returns an error, the tunnel
+restores a snapshot from before application-dependent processing and selects once
+without application evidence. This reapplies ordinary DNS/Fake-IP, hosts and
+sniffer policy before dialing. The failed candidate cannot heal, and identical
+text cannot replace its original authority callback. Ordinary preprocessing and
+sniffing may run once more with their existing deadlines; the background peek
+runs only on the final attempt. This is not a production latency policy.
 
 ## Source selection
 
@@ -85,8 +97,17 @@ replacement enabled, and conflicting DNS hints/hosts entries. Each checks the
 real route, dial destination and ClientHello relay. These are correctness tests,
 not latency benchmarks.
 
+An additional 36-case direct-reader VM matrix covers healthy authority,
+post-match crash/revocation/second-send/eviction/expiry/reader-close/restart, and
+a post-commit crash. Both IP families and process modes are covered. The helper
+receives maps via authenticated bootstrap, rather than inheriting capabilities
+or receiving positive names from the supervisor. Local tests also cover
+post-match metadata rollback and restoration of ordinary hosts policy. See
+[the consumption experiment](../../socketowner/experiments/hostname/CONSUMPTION.md)
+for scope and build instructions using a temporary two-module Go workspace.
+
 Production integration still needs a versioned optional reader interface,
-freshness/revocation at final consumption, an independent enable/disable setting,
+an independent enable/disable setting,
 bounded waits in the supported inbound path and service confinement. UDP, TUN,
 TPROXY and explicit proxy observation remain excluded. Broader sends,
 reinjection, completed TLS and browser encrypted-DNS/ECH workloads remain open.
