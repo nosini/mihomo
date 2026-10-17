@@ -143,8 +143,14 @@ Its controlled IPv4/IPv6 matrix completes TLS 1.2/1.3, verifies certificates,
 hostnames and certificate pins, rejects mismatches, and exchanges application
 bytes while preserving the selected route and original destination. Both TLS
 versions also pass ordinary fallback after observer stop or feature disablement.
-Broader sends, reinjection, browser encrypted-DNS/ECH and production performance
-validation remain open.
+The confined TUN matrix also proves TLS ticket resumption with new SSL objects
+and `SSL_clear` reuse onto new sockets for both TLS versions and IP families.
+Changed names select the corresponding domain rule, removed names use ordinary
+routing, and observer-stop fallback still completes resumed TLS. Both peers
+confirm actual resumption; repeated application exchanges preserve the committed
+connection and route. No runtime or profile change was needed for these cases.
+Broader sends, reinjection, early data, HelloRetryRequest, cross-origin reuse,
+browser encrypted-DNS/ECH and production performance validation remain open.
 
 The current reader and observer require [hostname contract profile 3](../../socketowner/hostname/PROFILE3.md).
 It admits one complete initial ClientHello record up to 16 KiB and verified
