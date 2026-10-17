@@ -6,9 +6,10 @@ does not depend on `find-process-mode`. The diagnostic reader is included only
 in Linux amd64 builds with `hostname_discovery_experimental`; ordinary builds
 reject an enabled configuration instead of silently accepting it.
 
-This remains an experimental feature. The observer currently has only a private
-VM entry point, and the existing `socketowner attach` command does not start
-it. There is no installed hostname observer service or stable public map ABI.
+This remains an experimental feature. The observer is socketowner's separate
+[`mihomo-hostname-observer`](../../socketowner/experiments/hostname/OBSERVER.md)
+command; the existing `socketowner attach` command does not start it.
+There is no installed hostname observer service or stable public map ABI.
 Keep the existing process owner loader and service setup unchanged.
 
 ## Configuration
