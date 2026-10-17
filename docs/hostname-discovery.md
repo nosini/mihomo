@@ -133,3 +133,9 @@ bytes while preserving the selected route and original destination. Both TLS
 versions also pass ordinary fallback after observer stop or feature disablement.
 Broader sends, reinjection, browser encrypted-DNS/ECH and production performance
 validation remain open.
+
+The current reader and observer use hostname contract profile 2 for final-release
+guard reclamation. Rebuild both when upgrading from profile 1. A mismatched
+observer returns unknown; the normal Mihomo module graph and process-owner ABI
+remain unchanged. The limit is 256 concurrently retained socket lifetimes;
+closed-and-released sockets no longer consume slots until observer restart.
