@@ -157,13 +157,18 @@ HelloRetryRequest. Message counts prove two ClientHellos/one retry against a
 one-ClientHello/no-retry control. Repeated exchanges preserve the connection
 and route, including observer loss after initial route selection; new sockets
 still use ordinary fallback. Wrong pins deliver no application request.
-Controlled same-origin HTTP/2 over TLS 1.2/1.3 also passes concurrent streams
+Controlled HTTP/2 over TLS 1.2/1.3 also passes concurrent streams
 and later-stream reuse through both confined paths and families. Interleaved
 requests/responses preserve the original connection, route and destination
 through observer stop/restart; a new TLS hostname selects its own route.
 Certificate, hostname and pin verification precede all HTTP/2 client bytes.
+Explicit cross-origin reuse with hostnames sharing the fixture IP/port and
+covered by the peer certificate preserves that original route, including on a
+fallback connection. A fresh TLS SNI still selects its own rule. The test client
+refuses an uncovered hostname before any HEADERS frame; valid origins can keep
+using the verified connection afterward.
 This does not add per-stream routing or prove browser cross-origin coalescing.
-Broader sends, reinjection, early data, cookie-only HRR, cross-origin reuse,
+Broader sends, reinjection, early data, cookie-only HRR, automatic browser coalescing,
 browser encrypted-DNS/ECH and production performance validation remain open.
 
 The current reader and observer require [hostname contract profile 3](../../socketowner/hostname/PROFILE3.md).
