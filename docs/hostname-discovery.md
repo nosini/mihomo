@@ -84,7 +84,7 @@ for existing development commands; both tags select the same reader.
 From the Mihomo checkout, build with an explicit local reader checkout:
 
 ```sh
-tools/with-hostname-reader.sh --reader-dir ../socketowner/hostname \
+CGO_ENABLED=0 tools/with-hostname-reader.sh --reader-dir ../socketowner/hostname \
     build -tags hostname_discovery -o mihomo-hostname .
 ```
 
