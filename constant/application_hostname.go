@@ -27,9 +27,9 @@ type applicationHostname struct {
 
 // SetApplicationHostname consumes an already validated, live association before
 // route selection. It does not authenticate a publisher or prove correlation;
-// the reader must do that before calling it. Only the tested TCP REDIRECT path
-// is admitted. The native tunnel supplies evidence only through its configured
-// reader on that admitted path.
+// the reader must do that before calling it. Only the tested TCP REDIRECT and
+// TUN system-stack paths are admitted. The native tunnel supplies evidence only
+// through its configured reader on those admitted paths.
 // validate must perform a bounded fresh check of the same reader/flow/record;
 // the tunnel calls it after rule matching and before committing the route.
 // A second, different observation permanently excludes application evidence on
@@ -39,7 +39,7 @@ func (m *Metadata) SetApplicationHostname(name string, role ApplicationHostnameR
 	m.applicationHostname = &applicationHostname{} // failed replacement cannot retain old evidence
 	normalized, err := normalizeApplicationHostname(name)
 	if err != nil || validate == nil || (role != ApplicationHostnameTLS && role != ApplicationHostnameECHInner) ||
-		m.NetWork != TCP || m.Type != REDIR || !m.SourceAddrPort().IsValid() || m.SrcPort == 0 ||
+		m.NetWork != TCP || (m.Type != REDIR && m.Type != TUN) || !m.SourceAddrPort().IsValid() || m.SrcPort == 0 ||
 		!m.AddrPort().IsValid() || m.DstPort == 0 || m.DNSMode == DNSFakeIP {
 		return errors.New("unusable application hostname association")
 	}
@@ -87,7 +87,7 @@ func (m *Metadata) HasApplicationHostname() bool {
 // yields to a verified connection association.
 func (m *Metadata) ApplicationHostname() string {
 	a := m.applicationHostname
-	if a == nil || a.name == "" || m.NetWork != TCP || m.Type != REDIR ||
+	if a == nil || a.name == "" || m.NetWork != TCP || (m.Type != REDIR && m.Type != TUN) ||
 		m.SourceAddrPort() != a.source || m.AddrPort() != a.dest ||
 		m.DNSMode == DNSFakeIP || (m.Host != "" && m.DNSMode != DNSMapping) {
 		return ""

@@ -178,3 +178,17 @@ func TestApplicationHostnameRuleChecksDoNotAllocate(t *testing.T) {
 		t.Fatal("invalid sniffed name did not suppress the application name")
 	}
 }
+
+func TestApplicationHostnameInboundTypes(t *testing.T) {
+	for _, tc := range []struct {
+		inbound C.Type
+		ok      bool
+	}{{C.REDIR, true}, {C.TUN, true}, {C.TPROXY, false}, {C.TUNNEL, false}, {C.HTTP, false}, {C.SOCKS5, false}} {
+		m := applicationMetadata()
+		m.Type = tc.inbound
+		err := setApplicationHostname(m, "route.invalid", C.ApplicationHostnameTLS)
+		if (err == nil) != tc.ok || (m.RuleHost() == "route.invalid") != tc.ok {
+			t.Fatalf("%s admitted=%v err=%v", tc.inbound, m.RuleHost() == "route.invalid", err)
+		}
+	}
+}

@@ -107,9 +107,10 @@ post-match metadata rollback and restoration of ordinary hosts policy. See
 [the consumption experiment](../../socketowner/experiments/hostname/CONSUMPTION.md)
 for scope and build instructions using a temporary two-module Go workspace.
 
-The native lookup now supplies independent configuration, a bounded wait and
-reload/disable cancellation. Production integration still needs a stable optional
-reader interface, packaging, a resident observer entry point and service
-confinement. UDP, TUN,
-TPROXY and explicit proxy observation remain excluded. Broader sends,
-reinjection, completed TLS and browser encrypted-DNS/ECH workloads remain open.
+The native lookup supplies independent configuration, a bounded wait and
+reload/disable cancellation through the separate optional reader module. A
+resident observer and optional confined service are available. TCP TUN
+connections from the system or mixed stack are admitted; UDP, TPROXY and
+explicit proxy observation remain excluded. Controlled completed TLS and
+application exchanges pass through the confined services. Broader sends,
+reinjection and browser encrypted-DNS/ECH workloads remain open.

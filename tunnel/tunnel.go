@@ -507,6 +507,20 @@ func handleUDPConn(packet C.PacketAdapter) {
 
 var errTCPMetadataPreprocess = errors.New("metadata preprocessing failed")
 
+// applicationHostnameFlow identifies the application's flow as the observer
+// keyed it: the accepted socket itself for REDIRECT, or the TUN stack's
+// original tuple in the accepted socket's network namespace.
+func applicationHostnameFlow(conn net.Conn, metadata *C.Metadata) (applicationhostname.Flow, error) {
+	if metadata.Type == C.TUN {
+		return applicationhostname.TUNFlow(conn, metadata.SourceAddrPort(), metadata.AddrPort())
+	}
+	flow, err := applicationhostname.AcceptedFlow(conn)
+	if err == nil && flow.Source != metadata.SourceAddrPort() {
+		err = applicationhostname.ErrUnavailable
+	}
+	return flow, err
+}
+
 // prepareTCPMetadata retains the normal DNS/Fake-IP and sniffer policy.
 // again marks a repeat after a discarded tentative preparation of the same
 // connection, so a sniffing failure is not counted twice.
@@ -585,11 +599,12 @@ func handleTCPConn(connCtx C.ConnContext) {
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
 	conn := connCtx.Conn()
-	// Only the proved local TCP REDIRECT path can request application evidence.
-	// Its configuration and lifetime are independent of process-name lookup.
+	// Only the proved TCP REDIRECT and TUN system-stack paths can request
+	// application evidence. Its configuration and lifetime are independent of
+	// process-name lookup.
 	var hostnameEvidence *applicationhostname.Evidence
-	if applicationhostname.Default.Config().Enable && metadata.NetWork == C.TCP && metadata.Type == C.REDIR && metadata.Host == "" && metadata.DstIP.IsValid() && !metadata.HasApplicationHostname() && !resolver.IsFakeIP(metadata.DstIP) {
-		if flow, err := applicationhostname.AcceptedFlow(conn); err == nil && flow.Source == metadata.SourceAddrPort() {
+	if applicationhostname.Default.Config().Enable && metadata.NetWork == C.TCP && (metadata.Type == C.REDIR || metadata.Type == C.TUN) && metadata.Host == "" && metadata.DstIP.IsValid() && !metadata.HasApplicationHostname() && !resolver.IsFakeIP(metadata.DstIP) {
+		if flow, err := applicationHostnameFlow(conn, metadata); err == nil {
 			if evidence, err := applicationhostname.Default.Lookup(flow); err == nil {
 				hostnameEvidence = evidence
 				defer evidence.Close() // also covers errors before route evaluation

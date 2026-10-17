@@ -52,11 +52,20 @@ active setting; no partial PATCH API is added by this change.
 
 ## Lookup and failure behavior
 
-Only TCP REDIRECT connections with a real IP destination and no explicit domain
-request lookup. Fake-IP, explicit inbound domain semantics, UDP, TUN, TPROXY and
-internal traffic keep their existing paths. The lookup takes the accepted
-socket's namespace and full post-NAT endpoints; it never uses process lookup's
-source-only owner map as hostname evidence.
+Only TCP REDIRECT and TUN connections with a real IP destination and no explicit
+domain request lookup. Fake-IP, explicit inbound domain semantics, UDP, TPROXY
+and internal traffic keep their existing paths. For REDIRECT the lookup takes the
+accepted socket's namespace and full post-NAT endpoints. For TUN it takes the
+`system` (or `mixed`) stack's original tuple in the namespace of the kernel socket
+that stack accepted; the observer keyed the application's egress by the same
+tuple. The `gvisor` stack (no kernel socket) and `auto-redirect` return unknown,
+as do applications in another network namespace than the TUN device. Lookup
+never uses process lookup's source-only owner map as hostname evidence.
+
+A TUN tuple comes from packets the kernel routed into the device, not from an
+accepted socket. A local process with CAP_NET_RAW could inject packets with an
+observed connection's tuple; this can only affect the route of its own injected
+connection, which can already choose any name through ordinary SNI.
 
 Each attempt opens at most one authenticated reader and keeps that reader's
 instance fixed through rule selection. It never adopts a replacement observer

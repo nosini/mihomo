@@ -2,7 +2,7 @@
 
 package tunnel_test
 
-// This test-only bridge runs the real REDIRECT listener and TCP tunnel. Its
+// This test-only bridge runs the real REDIRECT or TUN listener and TCP tunnel. Its
 // inherited socket speaks only to the supervising socketowner VM test, which
 // owns all BPF maps and links. This is not an external hostname service ABI.
 
@@ -29,9 +29,12 @@ import (
 	"github.com/metacubex/mihomo/component/sniffer"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
+	P "github.com/metacubex/mihomo/constant/provider"
 	S "github.com/metacubex/mihomo/constant/sniffer"
 	_ "github.com/metacubex/mihomo/hub/executor" // supplies config's temporaryUpdateGeneral link target
+	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/redir"
+	"github.com/metacubex/mihomo/listener/sing_tun"
 	"github.com/metacubex/mihomo/log"
 	R "github.com/metacubex/mihomo/rules/common"
 	T "github.com/metacubex/mihomo/tunnel"
@@ -169,7 +172,11 @@ func (h *hostnameVMTunnel) HandleTCPConn(conn net.Conn, m *C.Metadata) {
 	defer close(h.done) // one inbound per helper process
 	defer conn.Close()
 	e := hostnameVMEvent{Kind: "accepted", Source: conn.RemoteAddr().String(), Local: conn.LocalAddr().String(), Original: m.RemoteAddress()}
-	raw, err := conn.(*net.TCPConn).SyscallConn()
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	raw, err := tcp.SyscallConn()
 	if err != nil {
 		return
 	}
@@ -223,6 +230,12 @@ func (h *hostnameVMTunnel) HandleTCPConn(conn net.Conn, m *C.Metadata) {
 	h.Tunnel.HandleTCPConn(conn, m)
 }
 
+// The TUN listener also needs the provider view of the real tunnel.
+type hostnameVMTUNTunnel struct {
+	*hostnameVMTunnel
+	P.Tunnel
+}
+
 func TestVMHostnameRouteHelper(t *testing.T) {
 	if os.Getenv("HOSTNAME_VM_ROUTE_HELPER") != "1" {
 		t.Skip("launched only by socketowner's supervised VM experiment")
@@ -237,10 +250,17 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 	control := &hostnameVMControl{conn: conn, enc: json.NewEncoder(conn), dec: json.NewDecoder(conn)}
 	native := os.Getenv("HOSTNAME_VM_ROUTE_NATIVE") == "1"
 	var reader hostnameVMReader
+	tunDevice := os.Getenv("HOSTNAME_VM_ROUTE_TUN")
 	if endpoint := os.Getenv("HOSTNAME_VM_ROUTE_ENDPOINT"); endpoint != "" {
+		// A TUN inbound needs CAP_NET_ADMIN, as the hardened service grants;
+		// nothing else.
+		capabilities := "CapEff:\t0000000000000000"
+		if tunDevice != "" {
+			capabilities = "CapEff:\t0000000000001000"
+		}
 		status, err := os.ReadFile("/proc/self/status")
-		if err != nil || os.Geteuid() != 1000 || !bytes.Contains(status, []byte("CapEff:\t0000000000000000")) {
-			t.Fatal("Mihomo reader must be capability-free UID 1000")
+		if err != nil || os.Geteuid() != 1000 || !bytes.Contains(status, []byte(capabilities)) {
+			t.Fatal("Mihomo reader must be UID 1000 with no capability beyond its inbound's")
 		}
 		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 			t.Fatal(err)
@@ -309,12 +329,27 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 	}
 	T.UpdateRules([]C.Rule{rule}, nil, nil)
 	h := &hostnameVMTunnel{Tunnel: T.Tunnel, control: control, budget: time.Duration(budget) * time.Millisecond, start: &start, reader: reader, native: native, done: make(chan struct{})}
-	listener, err := redir.New(os.Getenv("HOSTNAME_VM_ROUTE_LISTEN"), h)
-	if err != nil {
-		t.Fatal(err)
+	address := tunDevice
+	if tunDevice != "" {
+		// The system stack accepts a kernel socket in this namespace and
+		// reports the original tuple; the supervisor routes into the device.
+		listener, err := sing_tun.New(LC.Tun{Enable: true, Device: tunDevice, Stack: C.TunSystem, MTU: 1500,
+			Inet4Address: []netip.Prefix{netip.MustParsePrefix("172.31.255.1/30")},
+			Inet6Address: []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")}},
+			hostnameVMTUNTunnel{h, T.Tunnel})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+	} else {
+		listener, err := redir.New(os.Getenv("HOSTNAME_VM_ROUTE_LISTEN"), h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		address = listener.Address()
 	}
-	defer listener.Close()
-	if err := control.event(hostnameVMEvent{Kind: "ready", Address: listener.Address()}); err != nil {
+	if err := control.event(hostnameVMEvent{Kind: "ready", Address: address}); err != nil {
 		t.Fatal(err)
 	}
 	select {
