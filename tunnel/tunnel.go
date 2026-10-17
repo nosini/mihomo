@@ -508,7 +508,9 @@ func handleUDPConn(packet C.PacketAdapter) {
 var errTCPMetadataPreprocess = errors.New("metadata preprocessing failed")
 
 // prepareTCPMetadata retains the normal DNS/Fake-IP and sniffer policy.
-func prepareTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata) error {
+// again marks a repeat after a discarded tentative preparation of the same
+// connection, so a sniffing failure is not counted twice.
+func prepareTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata, again bool) error {
 	preHandleFailed := false
 	if err := preHandleMetadata(metadata); err != nil {
 		log.Debugln("[Metadata PreHandle] error: %s", err)
@@ -519,7 +521,11 @@ func prepareTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata) error {
 	if sniffingEnable && snifferDispatcher.Enable() {
 		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
 		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
-		if snifferDispatcher.TCPSniff(conn, metadata) {
+		sniff := snifferDispatcher.TCPSniff
+		if again {
+			sniff = snifferDispatcher.TCPSniffAgain
+		}
+		if sniff(conn, metadata) {
 			// we now have a domain name
 			preHandleFailed = false
 		}
@@ -539,10 +545,12 @@ func prepareTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata) error {
 // post-match validation commits it. On failure, rebuild normal metadata from
 // the original image and select once without application evidence.
 func resolveTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata, beforeResolve func()) (C.Proxy, C.Rule, error) {
+	again := false
 	if metadata.HasApplicationHostname() {
 		fallback := metadata.WithoutApplicationHostname()
 		if metadata.ApplicationHostname() != "" {
-			if err := prepareTCPMetadata(conn, metadata); err == nil && metadata.ApplicationHostname() != "" {
+			again = true
+			if err := prepareTCPMetadata(conn, metadata, false); err == nil && metadata.ApplicationHostname() != "" {
 				proxy, rule, err := resolveMetadata(metadata)
 				if err == nil && metadata.ConfirmApplicationHostname() {
 					beforeResolve()
@@ -552,7 +560,7 @@ func resolveTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata, beforeResolv
 		}
 		*metadata = *fallback
 	}
-	if err := prepareTCPMetadata(conn, metadata); err != nil {
+	if err := prepareTCPMetadata(conn, metadata, again); err != nil {
 		return nil, nil, err
 	}
 	beforeResolve()

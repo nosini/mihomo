@@ -6,10 +6,13 @@ import (
 	"testing"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/component/sniffer"
 	"github.com/metacubex/mihomo/component/trie"
 	C "github.com/metacubex/mihomo/constant"
+	S "github.com/metacubex/mihomo/constant/sniffer"
 	R "github.com/metacubex/mihomo/rules/common"
 )
 
@@ -81,6 +84,47 @@ func TestApplicationHostnamePostMatchRollback(t *testing.T) {
 				t.Fatal("fallback retained application evidence")
 			}
 		})
+	}
+}
+
+// A rejected application route must not count the connection's sniffing
+// failure twice: the destination would be skipped after three connections.
+func TestApplicationHostnameFallbackCountsOneSniffFailure(t *testing.T) {
+	oldMode, oldRules, oldProxies, oldSniffing, oldDispatcher, oldMapper := mode, rules, proxies, sniffingEnable, snifferDispatcher, resolver.DefaultHostMapper
+	defer func() {
+		mode, rules, proxies, sniffingEnable, snifferDispatcher, resolver.DefaultHostMapper = oldMode, oldRules, oldProxies, oldSniffing, oldDispatcher, oldMapper
+	}()
+	dispatcher, err := sniffer.NewDispatcher(&sniffer.Config{Enable: true, ParsePureIp: true,
+		Sniffers: map[S.Type]sniffer.SnifferConfig{S.TLS: {Ports: utils.IntRanges[uint16]{utils.NewRange[uint16](443, 443)}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mode, rules, sniffingEnable, snifferDispatcher, resolver.DefaultHostMapper = Rule, nil, true, dispatcher, nil
+	proxies = map[string]C.Proxy{"DIRECT": applicationTestProxy{name: "DIRECT"}}
+	sniffed := func(application bool) bool {
+		m := &C.Metadata{NetWork: C.TCP, Type: C.REDIR, SrcIP: netip.MustParseAddr("192.0.2.10"), SrcPort: 12345, DstIP: netip.MustParseAddr("192.0.2.20"), DstPort: 443}
+		if application {
+			if err := m.SetApplicationHostname("route.invalid", C.ApplicationHostnameTLS, func() bool { return false }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		a, b := net.Pipe()
+		defer a.Close()
+		defer b.Close()
+		go b.Write([]byte("not a TLS record"))
+		conn := N.NewBufferedConn(a)
+		if proxy, _, err := resolveTCPMetadata(conn, m, func() {}); err != nil || proxy.Name() != "DIRECT" {
+			t.Fatalf("fallback route: %v %v", proxy, err)
+		}
+		return conn.Buffered() != 0
+	}
+	for i := 0; i < 3; i++ {
+		if !sniffed(true) {
+			t.Fatalf("connection %d was not sniffed", i)
+		}
+	}
+	if !sniffed(false) {
+		t.Fatal("three rejected application routes skipped sniffing for their destination")
 	}
 }
 

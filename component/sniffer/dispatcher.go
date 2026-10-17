@@ -120,6 +120,16 @@ func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter, packetSender C.PacketSend
 
 // TCPSniff returns true if the connection is sniffed to have a domain
 func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool {
+	return sd.tcpSniff(conn, metadata, true)
+}
+
+// TCPSniffAgain repeats TCPSniff for a connection whose earlier result was
+// discarded. That attempt already counted any failure for the destination.
+func (sd *Dispatcher) TCPSniffAgain(conn *N.BufferedConn, metadata *C.Metadata) bool {
+	return sd.tcpSniff(conn, metadata, false)
+}
+
+func (sd *Dispatcher) tcpSniff(conn *N.BufferedConn, metadata *C.Metadata, countFailure bool) bool {
 	if sd.shouldOverride(metadata) {
 		inWhitelist := false
 		for _, current := range sd.sniffers {
@@ -146,7 +156,7 @@ func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool 
 
 		host, config, err := sd.sniffDomain(conn, metadata)
 		if err != nil {
-			if !forceSniffer {
+			if !forceSniffer && countFailure {
 				sd.cacheSniffFailed(metadata)
 			}
 			log.Debugln("[Sniffer] All sniffing sniff failed with from [%s:%d] to [%s:%d]", metadata.SrcIP, metadata.SrcPort, metadata.String(), metadata.DstPort)
