@@ -152,7 +152,12 @@ Changed names select the corresponding domain rule, removed names use ordinary
 routing, and observer-stop fallback still completes resumed TLS. Both peers
 confirm actual resumption; repeated application exchanges preserve the committed
 connection and route. No runtime or profile change was needed for these cases.
-Broader sends, reinjection, early data, HelloRetryRequest, cross-origin reuse,
+The same confined paths also complete forced TLS 1.3 key-share
+HelloRetryRequest. Message counts prove two ClientHellos/one retry against a
+one-ClientHello/no-retry control. Repeated exchanges preserve the connection
+and route, including observer loss after initial route selection; new sockets
+still use ordinary fallback. Wrong pins deliver no application request.
+Broader sends, reinjection, early data, cookie-only HRR, cross-origin reuse,
 browser encrypted-DNS/ECH and production performance validation remain open.
 
 The current reader and observer require [hostname contract profile 3](../../socketowner/hostname/PROFILE3.md).
