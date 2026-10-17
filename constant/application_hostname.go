@@ -93,8 +93,10 @@ func (m *Metadata) ApplicationHostname() string {
 		return ""
 	}
 	if m.SniffHost != "" && a.role != ApplicationHostnameECHInner {
-		sniff, err := normalizeApplicationHostname(m.SniffHost)
-		if err != nil || sniff != a.name {
+		// Rules call this once each; compare without allocating. A valid name is
+		// ASCII, so EqualFold applies only ASCII case folding.
+		sniff := strings.TrimSuffix(m.SniffHost, ".")
+		if !validApplicationHostname(sniff) || !strings.EqualFold(sniff, a.name) {
 			return ""
 		}
 	}
@@ -106,21 +108,38 @@ func (m *Metadata) ApplicationHostname() string {
 // it never truncates, trims whitespace or guesses an IDNA conversion.
 func normalizeApplicationHostname(name string) (string, error) {
 	name = strings.TrimSuffix(name, ".")
-	if len(name) == 0 || len(name) > 253 {
-		return "", errors.New("invalid application hostname length")
-	}
-	if _, err := netip.ParseAddr(name); err == nil {
-		return "", errors.New("application hostname is an IP literal")
-	}
-	for _, label := range strings.Split(name, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return "", errors.New("invalid application hostname label")
-		}
-		for _, c := range []byte(label) {
-			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
-				return "", errors.New("invalid application hostname character")
-			}
-		}
+	if !validApplicationHostname(name) {
+		return "", errors.New("invalid application hostname")
 	}
 	return strings.ToLower(name), nil
+}
+
+// validApplicationHostname checks a name without its terminal root dot.
+func validApplicationHostname(name string) bool {
+	if len(name) == 0 || len(name) > 253 {
+		return false
+	}
+	numeric, label := true, 0
+	for i := 0; i <= len(name); i++ {
+		if i == len(name) || name[i] == '.' {
+			if label == 0 || label > 63 || name[i-label] == '-' || name[i-1] == '-' {
+				return false
+			}
+			label = 0
+			continue
+		}
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+			return false
+		}
+		numeric = numeric && c >= '0' && c <= '9'
+		label++
+	}
+	// Other IP literals contain characters rejected above.
+	if numeric {
+		if _, err := netip.ParseAddr(name); err == nil {
+			return false
+		}
+	}
+	return true
 }

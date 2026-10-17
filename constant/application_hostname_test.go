@@ -163,3 +163,18 @@ func TestApplicationHostnameRequiresFreshAuthority(t *testing.T) {
 		t.Fatal("failed consumption healed")
 	}
 }
+
+func TestApplicationHostnameRuleChecksDoNotAllocate(t *testing.T) {
+	m := applicationMetadata()
+	if err := setApplicationHostname(m, "route.invalid", C.ApplicationHostnameTLS); err != nil {
+		t.Fatal(err)
+	}
+	m.SniffHost = "ROUTE.invalid."
+	if allocs := testing.AllocsPerRun(100, func() { _ = m.RuleHost() }); allocs != 0 || m.RuleHost() != "route.invalid" {
+		t.Fatalf("rule host %q allocated %v times per check", m.RuleHost(), allocs)
+	}
+	m.SniffHost = "route_1.invalid"
+	if m.RuleHost() != "route_1.invalid" {
+		t.Fatal("invalid sniffed name did not suppress the application name")
+	}
+}
