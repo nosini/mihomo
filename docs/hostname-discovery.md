@@ -37,7 +37,9 @@ is illustrative, not a measured recommendation. This is one absolute budget
 for bootstrap, waiting for an eligible flow record and final post-match
 validation. Repeated reads never extend it. A missing/rejected observer or
 resource exhaustion can return unknown immediately; the budget is an upper
-bound, not a promise to wait on every failure. An in-progress kernel operation
+bound, not a promise to wait on every failure. Connections the observed process
+did not open have no flow record at all; they return unknown after one read
+instead of waiting. An in-progress kernel operation
 or ordinary rule/preprocessing work can add elapsed time, but evidence returned
 after the deadline cannot commit an application route.
 

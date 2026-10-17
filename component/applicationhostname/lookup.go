@@ -39,6 +39,10 @@ type DialFunc func(context.Context, string, time.Time) (Reader, error)
 
 var ErrUnavailable = errors.New("application hostname unavailable")
 
+// ErrNoFlow from a Reader means the observer has no record of the flow, so
+// waiting cannot produce a name for this connection.
+var ErrNoFlow = errors.New("application hostname flow was not observed")
+
 type setting struct {
 	config Config
 	ctx    context.Context
@@ -188,6 +192,11 @@ func (m *Manager) Lookup(flow Flow) (*Evidence, error) {
 			return nil, ErrUnavailable
 		}
 		candidate, err := reader.Lookup(flow, deadline)
+		// Connections from other processes never get a record; don't hold a
+		// reader slot and delay their routing for the whole wait budget.
+		if errors.Is(err, ErrNoFlow) {
+			return nil, ErrUnavailable
+		}
 		if err == nil && candidate != nil && candidate.Name() != "" && ctx.Err() == nil && s.ctx.Err() == nil && time.Now().Before(deadline) {
 			s.mu.Lock()
 			if m.current.Load() != s || ctx.Err() != nil || !time.Now().Before(deadline) {

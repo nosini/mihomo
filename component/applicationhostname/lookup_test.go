@@ -21,13 +21,16 @@ func (c *testCandidate) Validate() error {
 
 type testReader struct {
 	candidate Candidate
+	err       error
+	lookups   atomic.Int32
 	closed    atomic.Int32
 	deadline  time.Time
 }
 
 func (r *testReader) Lookup(_ Flow, deadline time.Time) (Candidate, error) {
 	r.deadline = deadline
-	return r.candidate, nil
+	r.lookups.Add(1)
+	return r.candidate, r.err
 }
 func (r *testReader) Close() { r.closed.Add(1) }
 func config() Config         { return Config{Enable: true, Endpoint: "/run/test/bootstrap.sock", WaitMS: 250} }
@@ -138,6 +141,24 @@ func TestLookupAbsoluteBudgetAndCancellation(t *testing.T) {
 		t.Fatal("unknown result extended or skipped the absolute budget")
 	}
 	awaitClosed(t, reader)
+}
+
+func TestLookupUnobservedFlowReturnsAtOnce(t *testing.T) {
+	reader := &testReader{err: ErrNoFlow}
+	m := New(func(context.Context, string, time.Time) (Reader, error) { return reader, nil })
+	m.Configure(config())
+	start := time.Now()
+	e, err := m.Lookup(flow())
+	if e != nil || !errors.Is(err, ErrUnavailable) {
+		t.Fatal("unobserved flow produced evidence")
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond || reader.lookups.Load() != 1 {
+		t.Fatalf("unobserved flow waited %v over %d reads", elapsed, reader.lookups.Load())
+	}
+	awaitClosed(t, reader)
+	if len(m.slots) != 0 {
+		t.Fatal("unobserved flow kept its reader slot")
+	}
 }
 
 func TestLookupCapacityAndFailure(t *testing.T) {
