@@ -92,7 +92,7 @@ Review changes to upstream dependencies and build behavior as part of the
 update. Record the selected revision in this document with the submodule pin.
 Never commit local modifications inside the upstream submodule.
 
-The original `connection-statistics` and `ebpf-hostname-discovery` branches are
-preserved with their existing history and layout. Their features are not applied
-by the `main` assembly. Existing attribution branches are also retained, so the
-pre-migration source and validation history remain accessible.
+On `ebpf-hostname-discovery`, `patches/0002-hostname-discovery.patch` adds
+hostname integration after the process-attribution patch. The reader, tests and
+build helper are under `src/`. See [hostname discovery](hostname-discovery.md)
+for optional reader builds and validation.

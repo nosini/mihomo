@@ -7,8 +7,8 @@ and `PROCESS-PATH` rules without giving mihomo permission to inspect other
 processes, and `WINE-PROCESS-NAME` and `WINE-PROCESS-PATH` rules for the Windows
 program behind a relay. Wine clients whose full path is unavailable can match by name.
 
-Connection statistics and TLS hostname discovery remain on their separate
-experimental branches and are excluded from `main`.
+This branch adds optional [TLS hostname discovery](docs/hostname-discovery.md)
+for TCP REDIRECT and TUN connections.
 
 ## Build and install
 

@@ -1,0 +1,414 @@
+diff --git a/component/sniffer/dispatcher.go b/component/sniffer/dispatcher.go
+index 3f5180ea5..0d705742e 100644
+--- a/component/sniffer/dispatcher.go
++++ b/component/sniffer/dispatcher.go
+@@ -120,6 +120,16 @@ func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter, packetSender C.PacketSend
+ 
+ // TCPSniff returns true if the connection is sniffed to have a domain
+ func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool {
++	return sd.tcpSniff(conn, metadata, true)
++}
++
++// TCPSniffAgain repeats TCPSniff for a connection whose earlier result was
++// discarded. That attempt already counted any failure for the destination.
++func (sd *Dispatcher) TCPSniffAgain(conn *N.BufferedConn, metadata *C.Metadata) bool {
++	return sd.tcpSniff(conn, metadata, false)
++}
++
++func (sd *Dispatcher) tcpSniff(conn *N.BufferedConn, metadata *C.Metadata, countFailure bool) bool {
+ 	if sd.shouldOverride(metadata) {
+ 		inWhitelist := false
+ 		for _, current := range sd.sniffers {
+@@ -146,7 +156,7 @@ func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool
+ 
+ 		host, config, err := sd.sniffDomain(conn, metadata)
+ 		if err != nil {
+-			if !forceSniffer {
++			if !forceSniffer && countFailure {
+ 				sd.cacheSniffFailed(metadata)
+ 			}
+ 			log.Debugln("[Sniffer] All sniffing sniff failed with from [%s:%d] to [%s:%d]", metadata.SrcIP, metadata.SrcPort, metadata.String(), metadata.DstPort)
+@@ -168,6 +178,11 @@ func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool
+ 
+ func replaceDomain(metadata *C.Metadata, host string, overrideDest bool) {
+ 	metadata.SniffHost = host
++	if metadata.ApplicationHostname() != "" {
++		// A usable application association supplies only a routing name. Keep
++		// the real destination and DNS provenance, even with override enabled.
++		return
++	}
+ 	if overrideDest {
+ 		log.Debugln("[Sniffer] Sniff %s [%s]-->[%s] success, replace domain [%s]-->[%s]",
+ 			metadata.NetWork,
+diff --git a/config/config.go b/config/config.go
+index 106e90db8..27fff0dcf 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/metacubex/mihomo/common/utils"
+ 	"github.com/metacubex/mihomo/common/yaml"
+ 	"github.com/metacubex/mihomo/component/age"
++	"github.com/metacubex/mihomo/component/applicationhostname"
+ 	"github.com/metacubex/mihomo/component/auth"
+ 	"github.com/metacubex/mihomo/component/cidr"
+ 	"github.com/metacubex/mihomo/component/fakeip"
+@@ -69,6 +70,8 @@ type General struct {
+ 	KeepAliveIdle      int                     `json:"keep-alive-idle"`
+ 	KeepAliveInterval  int                     `json:"keep-alive-interval"`
+ 	DisableKeepAlive   bool                    `json:"disable-keep-alive"`
++
++	HostnameDiscovery applicationhostname.Config `json:"hostname-discovery"`
+ }
+ 
+ // Inbound config
+@@ -452,6 +455,8 @@ type RawConfig struct {
+ 	KeepAliveInterval             int                     `yaml:"keep-alive-interval" json:"keep-alive-interval"`
+ 	DisableKeepAlive              bool                    `yaml:"disable-keep-alive" json:"disable-keep-alive"`
+ 
++	HostnameDiscovery applicationhostname.Config `yaml:"hostname-discovery" json:"hostname-discovery"`
++
+ 	ProxyProvider map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
+ 	RuleProvider  map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
+ 	Proxy         []map[string]any          `yaml:"proxies" json:"proxies"`
+@@ -763,6 +768,9 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
+ func temporaryUpdateGeneral(general *General) func()
+ 
+ func parseGeneral(cfg *RawConfig) (*General, error) {
++	if err := applicationhostname.Default.Validate(cfg.HostnameDiscovery); err != nil {
++		return nil, err
++	}
+ 	if cfg.GlobalClientFingerprint != "" {
+ 		log.Errorln("The `global-client-fingerprint` configuration is removed, please set `client-fingerprint` directly on the proxy instead")
+ 	}
+@@ -804,6 +812,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
+ 		FindProcessMode:    cfg.FindProcessMode,
+ 		FindProcessBPFMap:  cfg.FindProcessBPFMap,
+ 		FindProcessBPFOnly: cfg.FindProcessBPFOnly,
++		HostnameDiscovery:  cfg.HostnameDiscovery,
+ 		GlobalUA:           cfg.GlobalUA,
+ 		ETagSupport:        cfg.ETagSupport,
+ 		KeepAliveIdle:      cfg.KeepAliveIdle,
+diff --git a/constant/metadata.go b/constant/metadata.go
+index cc7a531b4..3df7a626c 100644
+--- a/constant/metadata.go
++++ b/constant/metadata.go
+@@ -216,7 +216,8 @@ type Metadata struct {
+ 	RawSrcAddr net.Addr `json:"-"`
+ 	RawDstAddr net.Addr `json:"-"`
+ 	// Only domain rule
+-	SniffHost string `json:"sniffHost"`
++	SniffHost           string `json:"sniffHost"`
++	applicationHostname *applicationHostname
+ 
+ 	// The Windows program behind a Wine connection, beside the process owning its socket
+ 	WineProcess     string `json:"wineProcess,omitempty"`
+@@ -282,6 +283,9 @@ func (m *Metadata) Resolved() bool {
+ }
+ 
+ func (m *Metadata) RuleHost() string {
++	if host := m.ApplicationHostname(); host != "" {
++		return host
++	}
+ 	if len(m.SniffHost) == 0 {
+ 		return m.Host
+ 	} else {
+@@ -292,7 +296,7 @@ func (m *Metadata) RuleHost() string {
+ // Pure is used to solve unexpected behavior
+ // when dialing proxy connection in DNSMapping mode.
+ func (m *Metadata) Pure() *Metadata {
+-	if (m.DNSMode == DNSMapping || m.DNSMode == DNSHosts) && m.DstIP.IsValid() {
++	if ((m.DNSMode == DNSMapping || m.DNSMode == DNSHosts) && m.DstIP.IsValid()) || m.ApplicationHostname() != "" {
+ 		copyM := *m
+ 		copyM.Host = ""
+ 		return &copyM
+diff --git a/go.mod b/go.mod
+index 770929131..79317701f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -124,7 +124,7 @@ require (
+ 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
+ 	github.com/pires/go-proxyproto v0.8.0 // indirect
+ 	github.com/safchain/ethtool v0.3.0 // indirect
+-	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a // indirect
++	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a
+ 	github.com/sina-ghaderi/poly1305 v0.0.0-20220724002748-c5926b03988b // indirect
+ 	github.com/sina-ghaderi/rabaead v0.0.0-20220730151906-ab6e06b96e8c // indirect
+ 	github.com/sina-ghaderi/rabbitio v0.0.0-20220730151941-9ce26f4f872e // indirect
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index 49044fe7c..aabd3add5 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/metacubex/mihomo/adapter"
+ 	"github.com/metacubex/mihomo/adapter/inbound"
+ 	"github.com/metacubex/mihomo/adapter/outboundgroup"
++	"github.com/metacubex/mihomo/component/applicationhostname"
+ 	"github.com/metacubex/mihomo/component/auth"
+ 	"github.com/metacubex/mihomo/component/ca"
+ 	"github.com/metacubex/mihomo/component/dialer"
+@@ -103,6 +104,9 @@ func ApplyConfig(cfg *config.Config, force bool) {
+ 	updateSniffer(cfg.Sniffer)
+ 	updateHosts(cfg.Hosts)
+ 	updateGeneral(cfg.General, true)
++	if err := applicationhostname.Default.Configure(cfg.General.HostnameDiscovery); err != nil {
++		log.Warnln("[Hostname discovery] %v", err)
++	}
+ 	updateDNS(cfg.DNS, cfg.General.IPv6)
+ 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
+ 	updateListeners(cfg.General, cfg.Listeners, force)
+@@ -175,6 +179,7 @@ func GetGeneral() *config.General {
+ 		FindProcessMode:    tunnel.FindProcessMode(),
+ 		FindProcessBPFMap:  process.SockOwnerMap(),
+ 		FindProcessBPFOnly: process.SockOwnerOnly(),
++		HostnameDiscovery:  applicationhostname.Default.Config(),
+ 		Sniffing:           tunnel.IsSniffing(),
+ 		GlobalUA:           mihomoHttp.UA(),
+ 		ETagSupport:        resource.ETag(),
+diff --git a/listener/sing_tun/server_notwindows.go b/listener/sing_tun/server_notwindows.go
+index eda79dc09..b3dae580d 100644
+--- a/listener/sing_tun/server_notwindows.go
++++ b/listener/sing_tun/server_notwindows.go
+@@ -3,9 +3,18 @@
+ package sing_tun
+ 
+ import (
++	"errors"
++
+ 	tun "github.com/metacubex/sing-tun"
+ )
+ 
+ func tunNew(options tun.Options) (tun.Tun, error) {
+-	return tun.New(options)
++	device, err := tun.New(options)
++	if err != nil {
++		return nil, err
++	}
++	if err := fixIPv6SourceRules(options); err != nil {
++		return nil, errors.Join(err, device.Close())
++	}
++	return device, nil
+ }
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index ece5beb80..034245b0e 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/metacubex/mihomo/common/atomic"
+ 	N "github.com/metacubex/mihomo/common/net"
+ 	"github.com/metacubex/mihomo/common/utils"
++	"github.com/metacubex/mihomo/component/applicationhostname"
+ 	"github.com/metacubex/mihomo/component/loopback"
+ 	"github.com/metacubex/mihomo/component/nat"
+ 	"github.com/metacubex/mihomo/component/process"
+@@ -297,11 +298,14 @@ func preHandleMetadata(metadata *C.Metadata) error {
+ 				// only clear dstIP if it is confirmed to be a fake IP
+ 				metadata.DstIP = netip.Addr{}
+ 				metadata.DNSMode = C.DNSFakeIP
+-			} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
+-				// redir-host should lookup the hosts
+-				metadata.DstIP, _ = node.RandIP()
+-			} else if node != nil && node.IsDomain {
+-				metadata.Host = node.Domain
++			} else if metadata.ApplicationHostname() == "" {
++				// A connection-bound application name preserves the real IP.
++				// Other redir-host connections still consult hosts overrides.
++				if node, ok := resolver.DefaultHosts.Search(host, false); ok {
++					metadata.DstIP, _ = node.RandIP()
++				} else if node != nil && node.IsDomain {
++					metadata.Host = node.Domain
++				}
+ 			}
+ 		} else if resolver.IsFakeIP(metadata.DstIP) {
+ 			return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
+@@ -328,9 +332,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 		attemptProcessLookup = metadata.Type != C.INNER
+ 	)
+ 
+-	if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
+-		metadata.DstIP, _ = node.RandIP()
+-		resolved = true
++	if metadata.ApplicationHostname() == "" {
++		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
++			metadata.DstIP, _ = node.RandIP()
++			resolved = true
++		}
+ 	}
+ 
+ 	helper := C.RuleMatchHelper{
+@@ -509,35 +515,41 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 	sender.Send(packet) // nonblocking
+ }
+ 
+-func handleTCPConn(connCtx C.ConnContext) {
+-	if !isHandle(connCtx.Metadata().Type) {
+-		_ = connCtx.Conn().Close()
+-		return
+-	}
+-
+-	defer func(conn net.Conn) {
+-		_ = conn.Close()
+-	}(connCtx.Conn())
++var errTCPMetadataPreprocess = errors.New("metadata preprocessing failed")
+ 
+-	metadata := connCtx.Metadata()
+-	if !metadata.Valid() {
+-		log.Warnln("[Metadata] not valid: %#v", metadata)
+-		return
++// applicationHostnameFlow identifies the application's flow as the observer
++// keyed it: the accepted socket itself for REDIRECT, or the TUN stack's
++// original tuple in the accepted socket's network namespace.
++func applicationHostnameFlow(conn net.Conn, metadata *C.Metadata) (applicationhostname.Flow, error) {
++	if metadata.Type == C.TUN {
++		return applicationhostname.TUNFlow(conn, metadata.SourceAddrPort(), metadata.AddrPort())
+ 	}
+-	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
++	flow, err := applicationhostname.AcceptedFlow(conn)
++	if err == nil && flow.Source != metadata.SourceAddrPort() {
++		err = applicationhostname.ErrUnavailable
++	}
++	return flow, err
++}
+ 
++// prepareTCPMetadata retains the normal DNS/Fake-IP and sniffer policy.
++// again marks a repeat after a discarded tentative preparation of the same
++// connection, so a sniffing failure is not counted twice.
++func prepareTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata, again bool) error {
+ 	preHandleFailed := false
+ 	if err := preHandleMetadata(metadata); err != nil {
+ 		log.Debugln("[Metadata PreHandle] error: %s", err)
+ 		preHandleFailed = true
+ 	}
+ 
+-	conn := connCtx.Conn()
+ 	conn.ResetPeeked() // reset before sniffer
+ 	if sniffingEnable && snifferDispatcher.Enable() {
+ 		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
+ 		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
+-		if snifferDispatcher.TCPSniff(conn, metadata) {
++		sniff := snifferDispatcher.TCPSniff
++		if again {
++			sniff = snifferDispatcher.TCPSniffAgain
++		}
++		if sniff(conn, metadata) {
+ 			// we now have a domain name
+ 			preHandleFailed = false
+ 		}
+@@ -547,28 +559,97 @@ func handleTCPConn(connCtx C.ConnContext) {
+ 	if preHandleFailed {
+ 		log.Debugln("[Metadata PreHandle] failed to sniff a domain for connection %s --> %s, give up",
+ 			metadata.SourceDetail(), metadata.RemoteAddress())
++		return errTCPMetadataPreprocess
++	}
++
++	return nil
++}
++
++// A tentative application route has no outbound side effects. Only a fresh
++// post-match validation commits it. On failure, rebuild normal metadata from
++// the original image and select once without application evidence.
++func resolveTCPMetadata(conn *N.BufferedConn, metadata *C.Metadata, beforeResolve func()) (C.Proxy, C.Rule, error) {
++	again := false
++	if metadata.HasApplicationHostname() {
++		fallback := metadata.WithoutApplicationHostname()
++		if metadata.ApplicationHostname() != "" {
++			again = true
++			if err := prepareTCPMetadata(conn, metadata, false); err == nil && metadata.ApplicationHostname() != "" {
++				proxy, rule, err := resolveMetadata(metadata)
++				if err == nil && metadata.ConfirmApplicationHostname() {
++					beforeResolve()
++					return proxy, rule, nil
++				}
++			}
++		}
++		*metadata = *fallback
++	}
++	if err := prepareTCPMetadata(conn, metadata, again); err != nil {
++		return nil, nil, err
++	}
++	beforeResolve()
++	return resolveMetadata(metadata)
++}
++
++func handleTCPConn(connCtx C.ConnContext) {
++	if !isHandle(connCtx.Metadata().Type) {
++		_ = connCtx.Conn().Close()
++		return
++	}
++
++	defer func(conn net.Conn) {
++		_ = conn.Close()
++	}(connCtx.Conn())
++
++	metadata := connCtx.Metadata()
++	if !metadata.Valid() {
++		log.Warnln("[Metadata] not valid: %#v", metadata)
+ 		return
+ 	}
++	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
++
++	conn := connCtx.Conn()
++	// Only the proved TCP REDIRECT and TUN system-stack paths can request
++	// application evidence. Its configuration and lifetime are independent of
++	// process-name lookup.
++	var hostnameEvidence *applicationhostname.Evidence
++	if applicationhostname.Default.Config().Enable && metadata.NetWork == C.TCP && (metadata.Type == C.REDIR || metadata.Type == C.TUN) && metadata.Host == "" && metadata.DstIP.IsValid() && !metadata.HasApplicationHostname() && !resolver.IsFakeIP(metadata.DstIP) {
++		if flow, err := applicationHostnameFlow(conn, metadata); err == nil {
++			if evidence, err := applicationhostname.Default.Lookup(flow); err == nil {
++				hostnameEvidence = evidence
++				defer evidence.Close() // also covers errors before route evaluation
++				_ = metadata.SetApplicationHostname(evidence.Name(), C.ApplicationHostnameTLS, evidence.Validate)
++			}
++		}
++	}
+ 
+ 	peekMutex := sync.Mutex{}
+-	if !conn.Peeked() {
+-		peekMutex.Lock()
+-		go func() {
+-			defer peekMutex.Unlock()
+-			_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+-			_, _ = conn.Peek(1)
+-			_ = conn.SetReadDeadline(time.Time{})
+-		}()
++	startPeek := func() {
++		if !conn.Peeked() {
++			peekMutex.Lock()
++			go func() {
++				defer peekMutex.Unlock()
++				_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
++				_, _ = conn.Peek(1)
++				_ = conn.SetReadDeadline(time.Time{})
++			}()
++		}
+ 	}
+ 
+-	proxy, rule, err := resolveMetadata(metadata)
++	proxy, rule, err := resolveTCPMetadata(conn, metadata, startPeek)
++	if hostnameEvidence != nil {
++		// Routing-only descriptors are never retained by the relay.
++		hostnameEvidence.Close()
++	}
+ 	if err != nil {
+-		log.Warnln("[Metadata] parse failed: %s", err.Error())
++		if !errors.Is(err, errTCPMetadataPreprocess) {
++			log.Warnln("[Metadata] parse failed: %s", err.Error())
++		}
+ 		return
+ 	}
+ 
+ 	dialMetadata := metadata
+-	if len(metadata.Host) > 0 {
++	if len(metadata.Host) > 0 && metadata.ApplicationHostname() == "" {
+ 		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
+ 			if dstIp, _ := node.RandIP(); !resolver.IsFakeIP(dstIp) {
+ 				dialMetadata.DstIP = dstIp
+@@ -577,6 +658,9 @@ func handleTCPConn(connCtx C.ConnContext) {
+ 			}
+ 		}
+ 	}
++	if metadata.ApplicationHostname() != "" {
++		dialMetadata = dialMetadata.Pure()
++	}
+ 
+ 	var peekBytes []byte
+ 	var peekLen int
