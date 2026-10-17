@@ -47,8 +47,9 @@ func AcceptedFlow(conn net.Conn) (Flow, error) {
 // stack accepts its own kernel socket in the TUN device's network namespace and
 // reports the application's original tuple from its NAT table; the observer
 // keyed the application socket's egress by that tuple in the same namespace.
-// A socket whose peer is the original source arrived through a kernel redirect
-// (auto-redirect) instead, which is not supported.
+// A TUN-labelled socket whose peer is the original source is not a recognized
+// system-stack translation. The auto-redirect listener labels its connections
+// REDIR and uses AcceptedFlow directly instead.
 func TUNFlow(conn net.Conn, source, destination netip.AddrPort) (Flow, error) {
 	accepted, err := AcceptedFlow(conn)
 	if err != nil {

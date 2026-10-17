@@ -42,9 +42,9 @@ import (
 )
 
 type hostnameVMEvent struct {
-	Kind, Address, Source, Local, Original, Name, Proxy, Host, RuleHost, SniffHost string
-	Netns, Cookie                                                                  uint64
-	ElapsedNS                                                                      int64
+	Kind, Address, Source, Local, Original, Name, Proxy, Host, RuleHost, SniffHost, InboundType string
+	Netns, Cookie                                                                               uint64
+	ElapsedNS                                                                                   int64
 }
 
 type hostnameVMReply struct {
@@ -171,7 +171,7 @@ type hostnameVMTunnel struct {
 func (h *hostnameVMTunnel) HandleTCPConn(conn net.Conn, m *C.Metadata) {
 	defer close(h.done) // one inbound per helper process
 	defer conn.Close()
-	e := hostnameVMEvent{Kind: "accepted", Source: conn.RemoteAddr().String(), Local: conn.LocalAddr().String(), Original: m.RemoteAddress()}
+	e := hostnameVMEvent{Kind: "accepted", Source: conn.RemoteAddr().String(), Local: conn.LocalAddr().String(), Original: m.RemoteAddress(), InboundType: m.Type.String()}
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {
 		return
@@ -333,10 +333,14 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 	if tunDevice != "" {
 		// The system stack accepts a kernel socket in this namespace and
 		// reports the original tuple; the supervisor routes into the device.
-		listener, err := sing_tun.New(LC.Tun{Enable: true, Device: tunDevice, Stack: C.TunSystem, MTU: 1500,
+		options := LC.Tun{Enable: true, Device: tunDevice, Stack: C.TunSystem, MTU: 1500,
 			Inet4Address: []netip.Prefix{netip.MustParsePrefix("172.31.255.1/30")},
-			Inet6Address: []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")}},
-			hostnameVMTUNTunnel{h, T.Tunnel})
+			Inet6Address: []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")}}
+		if os.Getenv("HOSTNAME_VM_ROUTE_AUTO_REDIRECT") == "1" {
+			options.AutoRoute, options.AutoRedirect, options.AutoDetectInterface = true, true, true
+			options.ExcludeUID = []uint32{1000} // the helper's own outbound dial
+		}
+		listener, err := sing_tun.New(options, hostnameVMTUNTunnel{h, T.Tunnel})
 		if err != nil {
 			t.Fatal(err)
 		}

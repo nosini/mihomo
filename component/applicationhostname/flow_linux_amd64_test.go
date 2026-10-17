@@ -57,7 +57,8 @@ func TestTUNFlowUsesOriginalTupleInAcceptedNamespace(t *testing.T) {
 	if err != nil || flow.Netns != accepted.Netns || flow.Source != netip.MustParseAddrPort("192.0.2.1:40000") || flow.Destination != destination {
 		t.Fatalf("wrong TUN flow: %+v: %v", flow, err)
 	}
-	// A kernel redirect keeps the original source as the accepted peer.
+	// An unchanged peer on TUN metadata is not a system-stack translation.
+	// The actual auto-redirect listener supplies REDIR metadata instead.
 	if _, err := TUNFlow(server, accepted.Source, destination); err == nil {
 		t.Fatal("redirected TUN connection accepted")
 	}

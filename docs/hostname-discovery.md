@@ -55,11 +55,13 @@ active setting; no partial PATCH API is added by this change.
 Only TCP REDIRECT and TUN connections with a real IP destination and no explicit
 domain request lookup. Fake-IP, explicit inbound domain semantics, UDP, TPROXY
 and internal traffic keep their existing paths. For REDIRECT the lookup takes the
-accepted socket's namespace and full post-NAT endpoints. For TUN it takes the
+accepted socket's namespace and full post-NAT endpoints, including local TCP
+from `auto-redirect`: that listener labels connections REDIR. For TUN it takes the
 `system` (or `mixed`) stack's original tuple in the namespace of the kernel socket
 that stack accepted; the observer keyed the application's egress by the same
-tuple. The `gvisor` stack (no kernel socket) and `auto-redirect` return unknown,
-as do applications in another network namespace than the TUN device. Lookup
+tuple. Native TCP from the `gvisor` stack has no kernel socket and returns
+unknown. TUN flow matching across network namespaces is outside the validated
+scope. Lookup
 never uses process lookup's source-only owner map as hostname evidence.
 
 A TUN tuple comes from packets the kernel routed into the device, not from an
@@ -143,8 +145,9 @@ Its controlled IPv4/IPv6 matrix completes TLS 1.2/1.3, verifies certificates,
 hostnames and certificate pins, rejects mismatches, and exchanges application
 bytes while preserving the selected route and original destination. Both TLS
 versions also pass ordinary fallback after observer stop or feature disablement.
-The confined TUN matrix also proves TLS ticket resumption with new SSL objects
-and `SSL_clear` reuse onto new sockets for both TLS versions and IP families.
+The confined TUN and local nftables auto-redirect matrices also prove TLS ticket
+resumption with new SSL objects and `SSL_clear` reuse onto new sockets for both
+TLS versions and IP families.
 Changed names select the corresponding domain rule, removed names use ordinary
 routing, and observer-stop fallback still completes resumed TLS. Both peers
 confirm actual resumption; repeated application exchanges preserve the committed
@@ -163,5 +166,20 @@ Rebuild both the observer and optional reader consumer when upgrading from
 profiles 1 or 2. A mismatched observer returns unknown; the normal Mihomo module
 graph and process-owner ABI remain unchanged. The limit is 256 concurrently
 retained socket lifetimes, reclaimed only after final release and callback drain.
+Local nftables `auto-redirect` is also tested for both IP families with healthy,
+delayed and missing evidence, observer death after matching, unobserved senders,
+completed TLS/resumption and forced source-port collisions. The accepted
+post-NAT source and destination distinguish simultaneous flows even when their
+original source ports coincide. The tests assert REDIR metadata and the actual
+redirect listener port. No adapter or routing change was needed; previous docs
+incorrectly described this path as unknown. Forwarded/prerouting, bridge and
+iptables-fallback paths remain unproved.
+
 The adapter still supports one exact OpenSSL build and target process; browser
 TLS stacks, ECH-inner names and additional interception modes remain unsupported.
+
+Confined IPv6 TUN and auto-redirect regressions exposed intermittent route
+bypass after a successful handshake: later packets selected the uplink, where the shipped
+kill switch dropped them. This transport limitation remains unresolved and
+does not widen hostname authority. Earlier IPv6 matrices passed, but repeated
+final runs failed; IPv6 transport is not reliably validated.
