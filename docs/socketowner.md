@@ -5,7 +5,7 @@ without BPF capabilities or permission to inspect other processes. The privilege
 loader is maintained, built and installed separately in the
 [socketowner repository](https://github.com/nosini/socketowner).
 
-[hardened-mihomo-service](https://github.com/nosini/hardened-mihomo-service#process-lookup)
+[hardened-proxy-service](https://github.com/nosini/hardened-proxy-service#process-lookup)
 provides deployment units, read-only map mounts, reader permissions and SELinux
 policy. Building or installing mihomo does not build or install the loader.
 
