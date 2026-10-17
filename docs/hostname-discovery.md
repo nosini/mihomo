@@ -125,6 +125,11 @@ and preservation of evidence while merely parsing another configuration.
 A privileged bootstrap test cancels an authenticated connection while its server
 withholds the reply. The existing routing matrices remain regression coverage.
 
-Production use still needs an independently managed observer with tested
-service confinement/restart behavior. Broader sends,
-reinjection, completed TLS and browser encrypted-DNS/ECH support remain open.
+The optional [hardened-service integration](https://github.com/nosini/hardened-proxy-service/blob/ebpf-hostname-discovery/docs/hostname-discovery.md)
+provides a separately confined observer with tested stop/crash/restart behavior.
+Its controlled IPv4/IPv6 matrix completes TLS 1.2/1.3, verifies certificates,
+hostnames and certificate pins, rejects mismatches, and exchanges application
+bytes while preserving the selected route and original destination. Both TLS
+versions also pass ordinary fallback after observer stop or feature disablement.
+Broader sends, reinjection, browser encrypted-DNS/ECH and production performance
+validation remain open.
