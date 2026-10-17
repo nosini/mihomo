@@ -1,6 +1,6 @@
 // Package applicationhostname manages optional, bounded application-name reads.
-// The normal build has no backend; the diagnostic adapter requires an explicit
-// experimental build tag and a workspace containing its companion module.
+// The normal build has no backend; the optional adapter requires an explicit
+// build tag and the separately versioned hostname reader module.
 package applicationhostname
 
 import (
@@ -70,7 +70,7 @@ func (m *Manager) Validate(config Config) error {
 		return errors.New("hostname-discovery endpoint must be a canonical absolute Unix pathname")
 	}
 	if m.dial == nil {
-		return errors.New("this build has no hostname-discovery backend; the diagnostic backend requires hostname_discovery_experimental on Linux amd64")
+		return errors.New("this build has no hostname-discovery backend; the optional backend requires hostname_discovery on Linux amd64")
 	}
 	return nil
 }

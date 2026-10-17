@@ -2,14 +2,15 @@
 
 Mihomo has an independent `hostname-discovery` configuration and a bounded
 lookup in its native TCP REDIRECT path. Discovery is disabled by default and
-does not depend on `find-process-mode`. The diagnostic reader is included only
-in Linux amd64 builds with `hostname_discovery_experimental`; ordinary builds
+does not depend on `find-process-mode`. The separately versioned reader is
+included only in Linux amd64 builds with `hostname_discovery`; ordinary builds
 reject an enabled configuration instead of silently accepting it.
 
 This remains an experimental feature. The observer is socketowner's separate
 [`mihomo-hostname-observer`](../../socketowner/experiments/hostname/OBSERVER.md)
 command; the existing `socketowner attach` command does not start it.
-There is no installed hostname observer service or stable public map ABI.
+The [optional hostname contract v1](../../socketowner/docs/hostname-interface.md)
+is separate from the process-owner ABI. There is no installed observer service.
 Keep the existing process owner loader and service setup unchanged.
 
 ## Configuration
@@ -74,11 +75,42 @@ for Mihomo. Observation failure does not change the process loader or kill-switc
 
 ## Development build and validation
 
-Use the temporary two-module Go workspace described in socketowner's
-[consumption experiment](../../socketowner/experiments/hostname/CONSUMPTION.md).
-Add `hostname_discovery_experimental` to the Mihomo build tags. The extra adapter
-imports the exact diagnostic facade only in that build; no unpublished module
-version or local `replace` directive is committed to the ordinary module graph.
+The optional backend imports `github.com/nosini/socketowner/hostname`, a
+separately versioned reader module requiring Go 1.25 or newer. It has no
+experiment/loader module dependency. Normal builds keep the existing Go baseline
+and omit the reader. `hostname_discovery_experimental` remains a build-tag alias
+for existing development commands; both tags select the same reader.
+
+From the Mihomo checkout, build with an explicit local reader checkout:
+
+```sh
+tools/with-hostname-reader.sh --reader-dir ../socketowner/hostname \
+    build -tags hostname_discovery -o mihomo-hostname .
+```
+
+After a reader release is published, replace `--reader-dir` with
+`--reader-version` and the exact release version (for example `v0.1.0` once that
+release exists). No reader release has been published at this checkpoint.
+The helper copies the ordinary go.mod/go.sum into a temporary build directory,
+adds only the optional reader requirement/replacement there, and runs Go with
+that modfile and `GOWORK=off`. It never edits the ordinary module files or installs
+the observer. Build artifacts default to `bin/hostname-reader`; set an absolute
+`HOSTNAME_BUILD_DIR` to use another project-specific scratch directory. It also
+accepts `test`, `vet` and `list`, with normal Go flags. Pass all required feature
+or integration-test tags explicitly.
+
+For example, compile the route matrix without an experiment dependency:
+
+```sh
+tools/with-hostname-reader.sh --reader-dir ../socketowner/hostname \
+    test -c -race -tags 'hostname_vm hostname_reader_vm hostname_discovery' \
+    -o mihomo-route.test ./tunnel
+```
+
+When also building socketowner's tagged VM supervisor, put socketowner, its
+nested `hostname` module and Mihomo in a temporary three-module workspace.
+The supervisor alone needs the experimental package; the native Mihomo binary
+and the direct-reader routing adapter use the independent reader module.
 
 The native VM helper parses actual YAML configuration and uses the ordinary
 tunnel lookup, without a wrapper supplying names or performing the lookup wait.
@@ -93,6 +125,6 @@ and preservation of evidence while merely parsing another configuration.
 A privileged bootstrap test cancels an authenticated connection while its server
 withholds the reply. The existing routing matrices remain regression coverage.
 
-Production use still needs stable reader packaging and an independently managed
-observer with tested service confinement/restart behavior. Broader sends,
+Production use still needs an independently managed observer with tested
+service confinement/restart behavior. Broader sends,
 reinjection, completed TLS and browser encrypted-DNS/ECH support remain open.

@@ -1,4 +1,4 @@
-//go:build hostname_discovery_experimental
+//go:build hostname_discovery || hostname_discovery_experimental
 
 package applicationhostname
 
@@ -6,12 +6,12 @@ import (
 	"context"
 	"time"
 
-	E "github.com/nosini/socketowner/experiments/hostname"
+	E "github.com/nosini/socketowner/hostname"
 )
 
-type diagnosticReader struct{ *E.Reader }
+type hostnameReader struct{ *E.Reader }
 
-func (r diagnosticReader) Lookup(flow Flow, deadline time.Time) (Candidate, error) {
+func (r hostnameReader) Lookup(flow Flow, deadline time.Time) (Candidate, error) {
 	return r.Reader.Lookup(E.TCPFlow{Netns: flow.Netns, Source: flow.Source, Destination: flow.Destination}, deadline)
 }
 func init() {
@@ -20,6 +20,6 @@ func init() {
 		if err != nil {
 			return nil, err
 		}
-		return diagnosticReader{reader}, nil
+		return hostnameReader{reader}, nil
 	})
 }

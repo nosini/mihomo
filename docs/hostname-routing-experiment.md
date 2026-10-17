@@ -43,10 +43,10 @@ end-to-end Fake-IP, encrypted DNS, ECH and browser support remain unverified.
 The extra `hostname_reader_vm` build now bootstraps socketowner's authenticated
 reader directly in capability-free Mihomo. Its 36-case matrix adds post-match
 validation, rollback before dialing and fixed routes after commitment. It uses a
-temporary Go workspace containing both repositories, with no production module
-dependency. See [CONSUMPTION.md](../../socketowner/experiments/hostname/CONSUMPTION.md)
+temporary Go workspace containing the independent reader module, with no ordinary
+Mihomo module dependency. See [CONSUMPTION.md](../../socketowner/experiments/hostname/CONSUMPTION.md)
 for the build, budgets and tested failure points. Both routing matrices pass
-together under the race detector. A stable versioned reader interface, an
-operator-managed observer and service confinement remain open. The
+together under the race detector. The [versioned reader module](../../socketowner/hostname/README.md)
+and resident observer command now exist; observer service confinement remains open. The
 [native lookup](hostname-discovery.md) adds independent configuration and a
 bounded wait through the ordinary tunnel in experimental backend builds.

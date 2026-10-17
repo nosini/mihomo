@@ -6,7 +6,7 @@ import (
 	"net/netip"
 	"time"
 
-	E "github.com/nosini/socketowner/experiments/hostname"
+	E "github.com/nosini/socketowner/hostname"
 )
 
 type hostnameVMDirectReader struct{ *E.Reader }
