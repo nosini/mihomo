@@ -7,11 +7,15 @@ included only in Linux amd64 builds with `hostname_discovery`; ordinary builds
 reject an enabled configuration instead of silently accepting it.
 
 This remains an experimental feature. The current observer supports an exact
-OpenSSL socket-BIO/send path, not every application using that library. Real
-curl 8.22.0/OpenSSL 3.5.3 custom-BIO traffic remains unattributed and uses ordinary
-fallback, as verified through confined TUN and local auto-redirect for both IP
-families and TLS versions. HTTPS verification still works, but hostname DOMAIN
-rules do not gain curl attribution from this profile. The observer is socketowner's separate
+OpenSSL socket-BIO/send path, not every application using that library. The base
+profile leaves real curl 8.22.0/OpenSSL 3.5.3 custom-BIO traffic unattributed and
+uses ordinary fallback. The separate opt-in [curl profile](../../socketowner/experiments/hostname/CURL.md)
+verifies its exact custom-BIO/filter/socket chain and selects hostname DOMAIN
+rules through confined TUN and local auto-redirect for both IP families and TLS
+versions. TLS verification and observer-stop fallback remain intact. This covers
+the tested direct TCP HTTP/1.1 build, not other curl paths or builds.
+
+The observer is socketowner's separate
 [`mihomo-hostname-observer`](../../socketowner/experiments/hostname/OBSERVER.md)
 command; the existing `socketowner attach` command does not start it.
 The [optional hostname contract v1](../../socketowner/docs/hostname-interface.md)
