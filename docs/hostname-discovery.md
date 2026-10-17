@@ -166,7 +166,11 @@ Explicit cross-origin reuse with hostnames sharing the fixture IP/port and
 covered by the peer certificate preserves that original route, including on a
 fallback connection. A fresh TLS SNI still selects its own rule. The test client
 refuses an uncovered hostname before any HEADERS frame; valid origins can keep
-using the verified connection afterward.
+using the verified connection afterward. A controlled 421 response on a coalesced
+second-origin stream is recovered by retrying identical headers/path/body over
+fresh verified TLS with that origin's SNI and own route. An open first-origin
+sibling and subsequent streams retain the original connection/route. The
+fixture explicitly drives this retry; browser retry decisions remain unproved.
 This does not add per-stream routing or prove browser cross-origin coalescing.
 Broader sends, reinjection, early data, cookie-only HRR, automatic browser coalescing,
 browser encrypted-DNS/ECH and production performance validation remain open.
