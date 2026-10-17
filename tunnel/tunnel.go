@@ -15,6 +15,7 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/applicationhostname"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
@@ -576,6 +577,18 @@ func handleTCPConn(connCtx C.ConnContext) {
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
 
 	conn := connCtx.Conn()
+	// Only the proved local TCP REDIRECT path can request application evidence.
+	// Its configuration and lifetime are independent of process-name lookup.
+	var hostnameEvidence *applicationhostname.Evidence
+	if applicationhostname.Default.Config().Enable && metadata.NetWork == C.TCP && metadata.Type == C.REDIR && metadata.Host == "" && metadata.DstIP.IsValid() && !metadata.HasApplicationHostname() && !resolver.IsFakeIP(metadata.DstIP) {
+		if flow, err := applicationhostname.AcceptedFlow(conn); err == nil && flow.Source == metadata.SourceAddrPort() {
+			if evidence, err := applicationhostname.Default.Lookup(flow); err == nil {
+				hostnameEvidence = evidence
+				defer evidence.Close() // also covers errors before route evaluation
+				_ = metadata.SetApplicationHostname(evidence.Name(), C.ApplicationHostnameTLS, evidence.Validate)
+			}
+		}
+	}
 
 	peekMutex := sync.Mutex{}
 	startPeek := func() {
@@ -591,6 +604,10 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 
 	proxy, rule, err := resolveTCPMetadata(conn, metadata, startPeek)
+	if hostnameEvidence != nil {
+		// Routing-only descriptors are never retained by the relay.
+		hostnameEvidence.Close()
+	}
 	if err != nil {
 		if !errors.Is(err, errTCPMetadataPreprocess) {
 			log.Warnln("[Metadata] parse failed: %s", err.Error())

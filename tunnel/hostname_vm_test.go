@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,11 +23,14 @@ import (
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/common/utils"
+	A "github.com/metacubex/mihomo/component/applicationhostname"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/sniffer"
+	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	S "github.com/metacubex/mihomo/constant/sniffer"
+	_ "github.com/metacubex/mihomo/hub/executor" // supplies config's temporaryUpdateGeneral link target
 	"github.com/metacubex/mihomo/listener/redir"
 	"github.com/metacubex/mihomo/log"
 	R "github.com/metacubex/mihomo/rules/common"
@@ -41,8 +45,9 @@ type hostnameVMEvent struct {
 }
 
 type hostnameVMReply struct {
-	Name  string
-	Close bool
+	Name   string
+	Close  bool
+	Reload bool
 }
 
 // Filled only by the extra hostname_reader_vm test build in a two-module Go
@@ -60,6 +65,7 @@ type hostnameVMBarrierRule struct {
 	control *hostnameVMControl
 	reader  hostnameVMReader
 	once    bool
+	native  bool
 }
 
 func (r *hostnameVMBarrierRule) Match(m *C.Metadata, helper C.RuleMatchHelper) (bool, string) {
@@ -68,7 +74,14 @@ func (r *hostnameVMBarrierRule) Match(m *C.Metadata, helper C.RuleMatchHelper) (
 		r.once = true
 		reply, err := r.control.exchange(hostnameVMEvent{Kind: "matched", Name: m.RuleHost()}, time.Now().Add(5*time.Second))
 		if err != nil || reply.Close {
-			r.reader.Close()
+			if r.native {
+				_ = A.Default.Configure(A.Config{})
+			} else {
+				r.reader.Close()
+			}
+		}
+		if reply.Reload && r.native {
+			_ = A.Default.Configure(A.Default.Config())
 		}
 	}
 	return matched, adapter
@@ -117,6 +130,18 @@ type hostnameVMProxy struct {
 }
 
 func (p *hostnameVMProxy) DialContext(ctx context.Context, m *C.Metadata) (C.Conn, error) {
+	if os.Getenv("HOSTNAME_VM_ROUTE_NATIVE") == "1" {
+		fds, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			return nil, err
+		}
+		for _, fd := range fds {
+			target, _ := os.Readlink("/proc/self/fd/" + fd.Name())
+			if strings.Contains(target, "bpf-map") || strings.Contains(target, "pidfd") {
+				return nil, fmt.Errorf("routing descriptor retained at dial: %s", target)
+			}
+		}
+	}
 	if err := p.control.event(hostnameVMEvent{Kind: "dial", Proxy: p.Name(), Original: m.RemoteAddress(), Host: m.Host, RuleHost: m.RuleHost(), SniffHost: m.SniffHost, ElapsedNS: time.Since(*p.start).Nanoseconds()}); err != nil {
 		return nil, err
 	}
@@ -136,6 +161,7 @@ type hostnameVMTunnel struct {
 	budget  time.Duration
 	start   *time.Time
 	reader  hostnameVMReader
+	native  bool
 	done    chan struct{}
 }
 
@@ -162,6 +188,13 @@ func (h *hostnameVMTunnel) HandleTCPConn(conn net.Conn, m *C.Metadata) {
 		return
 	}
 	*h.start = time.Now()
+	if h.native {
+		if err := h.control.event(hostnameVMEvent{Kind: "native-start"}); err != nil {
+			return
+		}
+		h.Tunnel.HandleTCPConn(conn, m)
+		return
+	}
 	deadline := h.start.Add(h.budget)
 	for h.budget > 0 && time.Now().Before(deadline) {
 		if h.reader != nil {
@@ -202,6 +235,7 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 	}
 	defer conn.Close()
 	control := &hostnameVMControl{conn: conn, enc: json.NewEncoder(conn), dec: json.NewDecoder(conn)}
+	native := os.Getenv("HOSTNAME_VM_ROUTE_NATIVE") == "1"
 	var reader hostnameVMReader
 	if endpoint := os.Getenv("HOSTNAME_VM_ROUTE_ENDPOINT"); endpoint != "" {
 		status, err := os.ReadFile("/proc/self/status")
@@ -211,18 +245,35 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 			t.Fatal(err)
 		}
-		if hostnameVMOpenReader == nil {
+		if !native && hostnameVMOpenReader == nil {
 			t.Fatal("build this helper with hostname_reader_vm in the two-module workspace")
 		}
-		reader, err = hostnameVMOpenReader(endpoint, time.Now().Add(time.Second))
-		if err != nil {
-			t.Fatal(err)
+		if !native {
+			reader, err = hostnameVMOpenReader(endpoint, time.Now().Add(time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
 		}
-		defer reader.Close()
 	}
 	budget, err := strconv.Atoi(os.Getenv("HOSTNAME_VM_ROUTE_BUDGET_MS"))
 	if err != nil || budget < 0 || budget > 1000 {
 		t.Fatal("invalid experiment budget")
+	}
+	if native {
+		text := fmt.Sprintf("hostname-discovery:\n  enable: true\n  endpoint: %q\n  wait-ms: %d\n", os.Getenv("HOSTNAME_VM_ROUTE_ENDPOINT"), budget)
+		raw, err := config.UnmarshalRawConfig([]byte(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := config.ParseRawConfig(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := A.Default.Configure(parsed.General.HostnameDiscovery); err != nil {
+			t.Fatal(err)
+		}
+		defer A.Default.Configure(A.Config{})
 	}
 	T.SetFindProcessMode(process.FindProcessOff)
 	if os.Getenv("HOSTNAME_VM_ROUTE_PROCESS") == "always" {
@@ -253,11 +304,11 @@ func TestVMHostnameRouteHelper(t *testing.T) {
 	}
 	T.UpdateProxies(proxies, nil)
 	var rule C.Rule = R.NewDomain("route.invalid", "NAMED")
-	if reader != nil {
-		rule = &hostnameVMBarrierRule{Rule: rule, control: control, reader: reader}
+	if reader != nil || native {
+		rule = &hostnameVMBarrierRule{Rule: rule, control: control, reader: reader, native: native}
 	}
 	T.UpdateRules([]C.Rule{rule}, nil, nil)
-	h := &hostnameVMTunnel{Tunnel: T.Tunnel, control: control, budget: time.Duration(budget) * time.Millisecond, start: &start, reader: reader, done: make(chan struct{})}
+	h := &hostnameVMTunnel{Tunnel: T.Tunnel, control: control, budget: time.Duration(budget) * time.Millisecond, start: &start, reader: reader, native: native, done: make(chan struct{})}
 	listener, err := redir.New(os.Getenv("HOSTNAME_VM_ROUTE_LISTEN"), h)
 	if err != nil {
 		t.Fatal(err)

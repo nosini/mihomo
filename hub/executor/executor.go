@@ -14,6 +14,7 @@ import (
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
+	"github.com/metacubex/mihomo/component/applicationhostname"
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
@@ -103,6 +104,9 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
+	if err := applicationhostname.Default.Configure(cfg.General.HostnameDiscovery); err != nil {
+		log.Warnln("[Hostname discovery] %v", err)
+	}
 	updateDNS(cfg.DNS, cfg.General.IPv6)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
 	updateListeners(cfg.General, cfg.Listeners, force)
@@ -175,6 +179,7 @@ func GetGeneral() *config.General {
 		FindProcessMode:   tunnel.FindProcessMode(),
 		FindProcessBPFMap: process.SockOwnerMap(),
 		FindProcBPFOnly:   process.SockOwnerOnly(),
+		HostnameDiscovery: applicationhostname.Default.Config(),
 		Sniffing:          tunnel.IsSniffing(),
 		GlobalUA:          mihomoHttp.UA(),
 		ETagSupport:       resource.ETag(),

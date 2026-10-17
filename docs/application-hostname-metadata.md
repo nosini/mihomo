@@ -1,9 +1,10 @@
 # Application hostname routing metadata
 
 Mihomo now has an internal, optional application-hostname field consumed by
-`Metadata.RuleHost()`. It is separate from `Host` and `SniffHost`. Ordinary builds
-have no reader, configuration or caller that supplies it; existing routing stays
-unchanged. The supervised `hostname_vm` experiment exercises the new path with
+`Metadata.RuleHost()`. It is separate from `Host` and `SniffHost`. The native
+[hostname lookup](hostname-discovery.md) has independent disabled-by-default
+configuration and requires an explicit experimental backend build. Ordinary
+builds have no backend and reject enabling it. The supervised `hostname_vm` experiment exercises the path with
 the existing domain matcher instead of substituting a cloned rule input.
 
 This is a routing semantic contract, not a public BPF layout or service protocol.
@@ -106,8 +107,9 @@ post-match metadata rollback and restoration of ordinary hosts policy. See
 [the consumption experiment](../../socketowner/experiments/hostname/CONSUMPTION.md)
 for scope and build instructions using a temporary two-module Go workspace.
 
-Production integration still needs a versioned optional reader interface,
-an independent enable/disable setting,
-bounded waits in the supported inbound path and service confinement. UDP, TUN,
+The native lookup now supplies independent configuration, a bounded wait and
+reload/disable cancellation. Production integration still needs a stable optional
+reader interface, packaging, a resident observer entry point and service
+confinement. UDP, TUN,
 TPROXY and explicit proxy observation remain excluded. Broader sends,
 reinjection, completed TLS and browser encrypted-DNS/ECH workloads remain open.

@@ -47,4 +47,6 @@ temporary Go workspace containing both repositories, with no production module
 dependency. See [CONSUMPTION.md](../../socketowner/experiments/hostname/CONSUMPTION.md)
 for the build, budgets and tested failure points. Both routing matrices pass
 together under the race detector. A stable versioned reader interface, an
-operator enable/wait entry point and service confinement remain open.
+operator-managed observer and service confinement remain open. The
+[native lookup](hostname-discovery.md) adds independent configuration and a
+bounded wait through the ordinary tunnel in experimental backend builds.

@@ -28,7 +28,8 @@ type applicationHostname struct {
 // SetApplicationHostname consumes an already validated, live association before
 // route selection. It does not authenticate a publisher or prove correlation;
 // the reader must do that before calling it. Only the tested TCP REDIRECT path
-// is admitted. There is no production caller until that reader is integrated.
+// is admitted. The native tunnel supplies evidence only through its configured
+// reader on that admitted path.
 // validate must perform a bounded fresh check of the same reader/flow/record;
 // the tunnel calls it after rule matching and before committing the route.
 // A second, different observation permanently excludes application evidence on

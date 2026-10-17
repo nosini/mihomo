@@ -19,6 +19,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/component/age"
+	"github.com/metacubex/mihomo/component/applicationhostname"
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/cidr"
 	"github.com/metacubex/mihomo/component/fakeip"
@@ -69,6 +70,8 @@ type General struct {
 	KeepAliveIdle     int                     `json:"keep-alive-idle"`
 	KeepAliveInterval int                     `json:"keep-alive-interval"`
 	DisableKeepAlive  bool                    `json:"disable-keep-alive"`
+
+	HostnameDiscovery applicationhostname.Config `json:"hostname-discovery"`
 }
 
 // Inbound config
@@ -452,6 +455,8 @@ type RawConfig struct {
 	KeepAliveInterval             int                     `yaml:"keep-alive-interval" json:"keep-alive-interval"`
 	DisableKeepAlive              bool                    `yaml:"disable-keep-alive" json:"disable-keep-alive"`
 
+	HostnameDiscovery applicationhostname.Config `yaml:"hostname-discovery" json:"hostname-discovery"`
+
 	ProxyProvider map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
 	RuleProvider  map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
 	Proxy         []map[string]any          `yaml:"proxies" json:"proxies"`
@@ -763,6 +768,9 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 func temporaryUpdateGeneral(general *General) func()
 
 func parseGeneral(cfg *RawConfig) (*General, error) {
+	if err := applicationhostname.Default.Validate(cfg.HostnameDiscovery); err != nil {
+		return nil, err
+	}
 	if cfg.GlobalClientFingerprint != "" {
 		log.Errorln("The `global-client-fingerprint` configuration is removed, please set `client-fingerprint` directly on the proxy instead")
 	}
@@ -804,6 +812,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 		FindProcessMode:   cfg.FindProcessMode,
 		FindProcessBPFMap: cfg.FindProcessBPFMap,
 		FindProcBPFOnly:   cfg.FindProcessBPFOnly,
+		HostnameDiscovery: cfg.HostnameDiscovery,
 		GlobalUA:          cfg.GlobalUA,
 		ETagSupport:       cfg.ETagSupport,
 		KeepAliveIdle:     cfg.KeepAliveIdle,
