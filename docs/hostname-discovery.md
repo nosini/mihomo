@@ -10,8 +10,9 @@ This remains an experimental feature. The observer is socketowner's separate
 [`mihomo-hostname-observer`](../../socketowner/experiments/hostname/OBSERVER.md)
 command; the existing `socketowner attach` command does not start it.
 The [optional hostname contract v1](../../socketowner/docs/hostname-interface.md)
-is separate from the process-owner ABI. There is no installed observer service.
-Keep the existing process owner loader and service setup unchanged.
+is separate from the process-owner ABI. The observer and its optional confined
+service are installed separately. Keep the existing process owner loader setup
+unchanged.
 
 ## Configuration
 
@@ -134,8 +135,16 @@ versions also pass ordinary fallback after observer stop or feature disablement.
 Broader sends, reinjection, browser encrypted-DNS/ECH and production performance
 validation remain open.
 
-The current reader and observer use hostname contract profile 2 for final-release
-guard reclamation. Rebuild both when upgrading from profile 1. A mismatched
-observer returns unknown; the normal Mihomo module graph and process-owner ABI
-remain unchanged. The limit is 256 concurrently retained socket lifetimes;
-closed-and-released sockets no longer consume slots until observer restart.
+The current reader and observer require [hostname contract profile 3](../../socketowner/hostname/PROFILE3.md).
+It admits one complete initial ClientHello record up to 16 KiB and verified
+retries within its original remaining bytes, on the same live SSL connection
+with the same name. Larger ClientHellos and actual short-write retries pass
+TLS 1.2/1.3 through the confined services. Unsupported later writes still revoke
+discovery authority without interrupting an already committed relay.
+
+Rebuild both the observer and optional reader consumer when upgrading from
+profiles 1 or 2. A mismatched observer returns unknown; the normal Mihomo module
+graph and process-owner ABI remain unchanged. The limit is 256 concurrently
+retained socket lifetimes, reclaimed only after final release and callback drain.
+The adapter still supports one exact OpenSSL build and target process; browser
+TLS stacks, ECH-inner names and additional interception modes remain unsupported.
