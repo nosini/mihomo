@@ -25,16 +25,16 @@ lan-disallowed-ips: # 禁止连接的 IP 地址段，黑名单优先级高于白
 #  - off, 不匹配进程，推荐在路由器上使用此模式
 find-process-mode: strict
 
-# Linux：mihomo-sockowner（独立的 socketowner 仓库）pin 到 bpffs 的 BPF map，记录每个连接所属的进程。
+# Linux：socketowner（独立仓库）pin 到 bpffs 的 BPF map，记录每个连接所属的进程。
 # 连接关闭后仍可查到进程，且无需扫描 /proc；该 map 不存在时使用原有查找方式。设为 "" 关闭
-# Linux: BPF map pinned by mihomo-sockowner (separate socketowner repository) that records the
+# Linux: BPF map pinned by socketowner (a separate repository) that records the
 # process behind each connection, so lookups work after the socket has closed and don't scan
 # /proc. Falls back to the usual lookup when the map is absent. Set to "" to turn it off.
 find-process-bpf-map: /sys/fs/bpf/mihomo/maps/conn_owners
-# Linux：mihomo-sockowner 以 -exec-paths 运行时，同一目录下还记录每个进程的可执行文件，mihomo 不再读取 /proc/<pid>/exe。
+# Linux：socketowner 以 -exec-paths 运行时，同一目录下还记录每个进程的可执行文件，mihomo 不再读取 /proc/<pid>/exe。
 # 设为 true 则只使用这些 BPF map，从不读取其他进程的 /proc，因此 mihomo 无需 CAP_SYS_PTRACE 和 CAP_DAC_READ_SEARCH；
 # map 中没有的连接不匹配进程
-# Linux: when mihomo-sockowner runs with -exec-paths, the same directory also records each
+# Linux: when socketowner runs with -exec-paths, the same directory also records each
 # process's executable, so mihomo doesn't read /proc/<pid>/exe. Set to true to use these BPF maps
 # alone and never read other processes' /proc entries, so that mihomo needs neither
 # CAP_SYS_PTRACE nor CAP_DAC_READ_SEARCH; connections the maps don't know match no process.
