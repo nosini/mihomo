@@ -178,8 +178,11 @@ iptables-fallback paths remain unproved.
 The adapter still supports one exact OpenSSL build and target process; browser
 TLS stacks, ECH-inner names and additional interception modes remain unsupported.
 
-Confined IPv6 TUN and auto-redirect regressions exposed intermittent route
-bypass after a successful handshake: later packets selected the uplink, where the shipped
-kill switch dropped them. This transport limitation remains unresolved and
-does not widen hostname authority. Earlier IPv6 matrices passed, but repeated
-final runs failed; IPv6 transport is not reliably validated.
+Confined IPv6 TUN and auto-redirect regression testing exposed an upstream
+policy-rule ordering bug: initial connects chose the TUN, but later lookups
+with the socket's chosen source address skipped its table. Mihomo's Linux TUN
+constructor moves sing-tun's two blanket bypass rules behind its existing
+TUN-source lookups, within the same owned priority range. The upstream module
+stays unchanged and normal listener cleanup removes the adjusted rules. Service tests assert both lookup
+forms and flush the route cache between application exchanges on one live TLS
+connection. The kill switch and hostname authority checks stay unchanged.
