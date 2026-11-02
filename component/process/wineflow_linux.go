@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -24,7 +25,7 @@ const (
 	wineFlowsMap     = "wine_flows"
 	wineABIMap       = "wine_abi"
 	wineHeartbeatMap = "wine_heartbeat"
-	wineABIVersion   = uint32(1)
+	wineABIVersion   = uint32(2)
 	wineImageBytes   = 1024
 	wineStatusKnown  = 1
 	// The publisher writes its heartbeat every second.
@@ -34,16 +35,16 @@ const (
 type wineFlowValue struct {
 	SocketID         uint64
 	ServerStartNs    uint64
-	WindowsStartTime uint64
+	ClientStartNs    uint64
 	CapturedBootNs   uint64
 	ServerTgid       uint32
 	UID              uint32
 	WindowsPID       uint32
-	ClientUnixPID    uint32
+	ClientTgid       uint32
 	Status           uint32
 	ImageBytes       uint32
 	Protocol         uint32
-	_                uint32
+	Encoding         uint32
 	Image            [wineImageBytes / 2]uint16
 }
 
@@ -171,11 +172,26 @@ func lookupWineFlow(network string, ip netip.Addr, srcPort int) (uid uint32, pat
 	return value.UID, image, true
 }
 
-// wineImagePath decodes the UTF-16 image. socketowner published it only after
-// checking the length; a reader of a shared ABI checks again.
+// wineImagePath decodes the image: a UTF-16 Windows path, or the filename alone
+// in bytes for clients with no reachable path. socketowner published it only
+// after checking the length; a reader of a shared ABI checks again.
 func wineImagePath(value *wineFlowValue) (string, bool) {
 	size := value.ImageBytes
-	if size < 2 || size > wineImageBytes || size%2 != 0 {
+	if value.Encoding == 1 {
+		if size == 0 || size > wineImageBytes {
+			return "", false
+		}
+		name := make([]byte, 0, size+1)
+		for _, w := range value.Image[:(size+1)/2] {
+			name = append(name, byte(w), byte(w>>8))
+		}
+		image := string(name[:size])
+		if !utf8.ValidString(image) || strings.ContainsAny(image, "\x00/\\") {
+			return "", false
+		}
+		return image, true
+	}
+	if value.Encoding != 0 || size < 2 || size > wineImageBytes || size%2 != 0 {
 		return "", false
 	}
 	image := string(utf16.Decode(value.Image[:size/2]))

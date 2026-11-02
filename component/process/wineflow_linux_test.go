@@ -32,7 +32,18 @@ func TestWineImagePath(t *testing.T) {
 	assert.Equal(t, "firefox", ProcessBaseName("/usr/bin/firefox"))
 	assert.Equal(t, WineUnknown, ProcessBaseName(WineUnknown))
 
+	mapped := &wineFlowValue{Encoding: 1, ImageBytes: 9}
+	for i, b := range []byte("alpha.exe") {
+		mapped.Image[i/2] |= uint16(b) << (8 * (i % 2))
+	}
+	path, ok = wineImagePath(mapped)
+	assert.True(t, ok)
+	assert.Equal(t, "alpha.exe", path)
+	assert.Equal(t, "alpha.exe", ProcessBaseName(path))
+
 	for name, v := range map[string]*wineFlowValue{
+		"encoding":  {Encoding: 2, ImageBytes: 2},
+		"unnamed":   {Encoding: 1},
 		"empty":     {},
 		"odd":       {ImageBytes: 3},
 		"oversized": {ImageBytes: wineImageBytes + 2},
