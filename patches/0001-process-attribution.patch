@@ -1,0 +1,198 @@
+diff --git a/component/process/process.go b/component/process/process.go
+index 464f5a79b..a053fcba3 100644
+--- a/component/process/process.go
++++ b/component/process/process.go
+@@ -3,6 +3,8 @@ package process
+ import (
+ 	"errors"
+ 	"net/netip"
++	"path/filepath"
++	"strings"
+ 
+ 	C "github.com/metacubex/mihomo/constant"
+ )
+@@ -18,10 +20,24 @@ const (
+ 	UDP = "udp"
+ )
+ 
++// DefaultSockOwnerMap is where the independently installed socketowner loader
++// pins the map used on Linux. See docs/socketowner.md.
++const DefaultSockOwnerMap = "/sys/fs/bpf/mihomo/maps/conn_owners"
++
+ func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, string, error) {
+ 	return findProcessName(network, srcIP, srcPort)
+ }
+ 
++// ProcessBaseName returns the name of a process path from FindProcessName.
++// Windows images keep their backslashes, which filepath.Base doesn't split on
++// Linux, and rules name them like any other process.
++func ProcessBaseName(path string) string {
++	if i := strings.LastIndexByte(path, '\\'); i >= 0 {
++		return path[i+1:]
++	}
++	return filepath.Base(path)
++}
++
+ // PackageNameResolver
+ // never change type traits because it's used in CMFA
+ type PackageNameResolver func(metadata *C.Metadata) (string, error)
+diff --git a/component/process/process_linux.go b/component/process/process_linux.go
+index 2e36f6741..95c544ceb 100644
+--- a/component/process/process_linux.go
++++ b/component/process/process_linux.go
+@@ -63,6 +63,18 @@ type inetDiagResponse struct {
+ }
+ 
+ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
++	if uid, path, ok := lookupWineFlow(network, ip, srcPort); ok {
++		return uid, path, nil
++	}
++	if owner, ok := lookupSockOwner(network, ip, srcPort); ok {
++		if path, err := resolveSockOwnerPath(owner); err == nil {
++			return owner.UID, path, nil
++		}
++	}
++	if SockOwnerOnly() {
++		return 0, "", ErrNotFound
++	}
++
+ 	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort)
+ 	if runtime.GOOS == "android" {
+ 		// on Android (especially recent releases), netlink INET_DIAG can fail or return UID 0 / empty process info for some apps
+@@ -179,7 +191,10 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
+ 	if err != nil {
+ 		return "", err
+ 	}
++	return resolveProcessNameByProcEntries(files, inode, uid)
++}
+ 
++func resolveProcessNameByProcEntries(files []os.DirEntry, inode, uid uint32) (string, error) {
+ 	buffer := make([]byte, unix.PathMax)
+ 	socket := fmt.Appendf(nil, "socket:[%d]", inode)
+ 
+@@ -190,6 +205,9 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
+ 
+ 		info, err := f.Info()
+ 		if err != nil {
++			if os.IsNotExist(err) {
++				continue
++			}
+ 			return "", err
+ 		}
+ 		if info.Sys().(*syscall.Stat_t).Uid != uid {
+diff --git a/config/config.go b/config/config.go
+index 707114a33..f3441fcf5 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -61,6 +61,8 @@ type General struct {
+ 	GeositeMatcher    string                  `json:"geosite-matcher"`
+ 	TCPConcurrent     bool                    `json:"tcp-concurrent"`
+ 	FindProcessMode   process.FindProcessMode `json:"find-process-mode"`
++	FindProcessBPFMap string                  `json:"find-process-bpf-map"`
++	FindProcBPFOnly   bool                    `json:"find-process-bpf-only"`
+ 	Sniffing          bool                    `json:"sniffing"`
+ 	GlobalUA          string                  `json:"global-ua"`
+ 	ETagSupport       bool                    `json:"etag-support"`
+@@ -441,6 +443,8 @@ type RawConfig struct {
+ 	GeositeMatcher                string                  `yaml:"geosite-matcher" json:"geosite-matcher"`
+ 	TCPConcurrent                 bool                    `yaml:"tcp-concurrent" json:"tcp-concurrent"`
+ 	FindProcessMode               process.FindProcessMode `yaml:"find-process-mode" json:"find-process-mode"`
++	FindProcessBPFMap             string                  `yaml:"find-process-bpf-map" json:"find-process-bpf-map"`
++	FindProcessBPFOnly            bool                    `yaml:"find-process-bpf-only" json:"find-process-bpf-only"`
+ 	GlobalClientFingerprint       string                  `yaml:"global-client-fingerprint" json:"global-client-fingerprint"`
+ 	GlobalUA                      string                  `yaml:"global-ua" json:"global-ua"`
+ 	ETagSupport                   bool                    `yaml:"etag-support" json:"etag-support"`
+@@ -500,6 +504,7 @@ func DefaultRawConfig() *RawConfig {
+ 		ProxyGroup:        []map[string]any{},
+ 		TCPConcurrent:     false,
+ 		FindProcessMode:   process.FindProcessStrict,
++		FindProcessBPFMap: process.DefaultSockOwnerMap,
+ 		GlobalUA:          "clash.meta/" + C.Version,
+ 		ETagSupport:       true,
+ 		DNS: RawDNS{
+@@ -797,6 +802,8 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
+ 		GeositeMatcher:    cfg.GeositeMatcher,
+ 		TCPConcurrent:     cfg.TCPConcurrent,
+ 		FindProcessMode:   cfg.FindProcessMode,
++		FindProcessBPFMap: cfg.FindProcessBPFMap,
++		FindProcBPFOnly:   cfg.FindProcessBPFOnly,
+ 		GlobalUA:          cfg.GlobalUA,
+ 		ETagSupport:       cfg.ETagSupport,
+ 		KeepAliveIdle:     cfg.KeepAliveIdle,
+diff --git a/docs/config.yaml b/docs/config.yaml
+index 7e51bb882..21ce02d62 100644
+--- a/docs/config.yaml
++++ b/docs/config.yaml
+@@ -25,6 +25,21 @@ lan-disallowed-ips: # 禁止连接的 IP 地址段，黑名单优先级高于白
+ #  - off, 不匹配进程，推荐在路由器上使用此模式
+ find-process-mode: strict
+ 
++# Linux：socketowner（独立仓库）pin 到 bpffs 的 BPF map，记录每个连接所属的进程。
++# 连接关闭后仍可查到进程，且无需扫描 /proc；该 map 不存在时使用原有查找方式。设为 "" 关闭
++# Linux: BPF map pinned by socketowner (a separate repository) that records the
++# process behind each connection, so lookups work after the socket has closed and don't scan
++# /proc. Falls back to the usual lookup when the map is absent. Set to "" to turn it off.
++find-process-bpf-map: /sys/fs/bpf/mihomo/maps/conn_owners
++# Linux：socketowner 以 -exec-paths 运行时，同一目录下还记录每个进程的可执行文件，mihomo 不再读取 /proc/<pid>/exe。
++# 设为 true 则只使用这些 BPF map，从不读取其他进程的 /proc，因此 mihomo 无需 CAP_SYS_PTRACE 和 CAP_DAC_READ_SEARCH；
++# map 中没有的连接不匹配进程
++# Linux: when socketowner runs with -exec-paths, the same directory also records each
++# process's executable, so mihomo doesn't read /proc/<pid>/exe. Set to true to use these BPF maps
++# alone and never read other processes' /proc entries, so that mihomo needs neither
++# CAP_SYS_PTRACE nor CAP_DAC_READ_SEARCH; connections the maps don't know match no process.
++find-process-bpf-only: false
++
+ mode: rule
+ 
+ #自定义 geodata url
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index 796face2f..410bcd43b 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -21,6 +21,7 @@ import (
+ 	mihomoHttp "github.com/metacubex/mihomo/component/http"
+ 	"github.com/metacubex/mihomo/component/iface"
+ 	"github.com/metacubex/mihomo/component/keepalive"
++	"github.com/metacubex/mihomo/component/process"
+ 	"github.com/metacubex/mihomo/component/profile"
+ 	"github.com/metacubex/mihomo/component/profile/cachefile"
+ 	"github.com/metacubex/mihomo/component/resolver"
+@@ -172,6 +173,8 @@ func GetGeneral() *config.General {
+ 		GeositeMatcher:    geodata.SiteMatcherName(),
+ 		TCPConcurrent:     dialer.GetTcpConcurrent(),
+ 		FindProcessMode:   tunnel.FindProcessMode(),
++		FindProcessBPFMap: process.SockOwnerMap(),
++		FindProcBPFOnly:   process.SockOwnerOnly(),
+ 		Sniffing:          tunnel.IsSniffing(),
+ 		GlobalUA:          mihomoHttp.UA(),
+ 		ETagSupport:       resource.ETag(),
+@@ -393,6 +396,8 @@ func temporaryUpdateGeneral(general *config.General) func() {
+ func updateGeneral(general *config.General, logging bool) {
+ 	tunnel.SetMode(general.Mode)
+ 	tunnel.SetFindProcessMode(general.FindProcessMode)
++	process.SetSockOwnerMap(general.FindProcessBPFMap)
++	process.SetSockOwnerOnly(general.FindProcBPFOnly)
+ 	resolver.DisableIPv6 = !general.IPv6
+ 
+ 	dialer.SetTcpConcurrent(general.TCPConcurrent)
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 86dbc14ae..df20b9acf 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -6,7 +6,6 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+-	"path/filepath"
+ 	"runtime"
+ 	"strings"
+ 	"sync"
+@@ -357,7 +356,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 					if err != nil {
+ 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+ 					} else {
+-						metadata.Process = filepath.Base(path)
++						metadata.Process = process.ProcessBaseName(path)
+ 						metadata.ProcessPath = path
+ 						metadata.Uid = uid
+ 

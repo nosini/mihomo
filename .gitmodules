@@ -1,0 +1,4 @@
+[submodule "mihomo"]
+	path = upstream/mihomo
+	url = https://github.com/MetaCubeX/mihomo.git
+	branch = Alpha

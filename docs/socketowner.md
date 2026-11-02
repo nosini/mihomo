@@ -46,13 +46,13 @@ numbers; their supported map ABI must match.
 The unprivileged reader and process-matching tests live here. Object and loader
 tests live in socketowner. To run the integration suite on a disposable Linux
 machine with BPF capabilities and an active BPF LSM, first attach the separately
-built loader with `-exec-paths`, then build from this checkout:
+built loader with `-exec-paths`, then build the assembled source from this checkout:
 
 ```sh
-go test ./component/process
-go test -c -tags sockowner_vm -o process.test ./component/process
+make test-process
+make test-vm
 sudo env SOCKOWNER_MAP=/sys/fs/bpf/mihomo/maps/conn_owners \
-    ./process.test -test.v -test.run 'SockOwner|ExecPath|ExecMaps'
+    ./bin/process.test -test.v -test.run 'SockOwner|ExecPath|ExecMaps'
 ```
 
 A dedicated loader `-pin` directory can be used with the corresponding
