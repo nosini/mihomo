@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -357,7 +356,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 					if err != nil {
 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
 					} else {
-						metadata.Process = filepath.Base(path)
+						metadata.Process = process.ProcessBaseName(path)
 						metadata.ProcessPath = path
 						metadata.Uid = uid
 

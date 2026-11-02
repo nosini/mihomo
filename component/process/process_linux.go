@@ -63,6 +63,9 @@ type inetDiagResponse struct {
 }
 
 func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
+	if uid, path, ok := lookupWineFlow(network, ip, srcPort); ok {
+		return uid, path, nil
+	}
 	if owner, ok := lookupSockOwner(network, ip, srcPort); ok {
 		if path, err := resolveSockOwnerPath(owner); err == nil {
 			return owner.UID, path, nil
