@@ -48,7 +48,7 @@ rules:
 Native socketowner and Wine attribution support cooperative applications; they
 are not a security boundary against a program forging its own identity. Review
 unknown-flow and DNS behavior in the
-[Wine observer documentation](https://github.com/nosini/socketowner/tree/wine-process-attribution/experiments/wine)
+[Wine observer documentation](https://github.com/nosini/socketowner/tree/main/wine)
 before adding a blanket `wine-unknown` rejection.
 
 ## Development and license

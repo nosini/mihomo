@@ -29,9 +29,10 @@ lookup.
 This reader supports [socketowner map interface v1](https://github.com/nosini/socketowner/blob/main/docs/map-interface.md).
 
 It also reads socketowner's optional Windows identity maps, pinned beside the
-others by its Wine experiment. A flow they cover reports the Windows program, so
+others by its Wine observer. A flow they cover reports the Windows program, so
 `PROCESS-NAME` and `PROCESS-PATH` match its `.exe`; one they can't identify
-reports the process `wine-unknown`. This needs that experiment's branch.
+reports the process `wine-unknown`. The reader and observer are available on
+their respective `main` branches.
 It requires `abi_version` beside `conn_owners`, checks its value before opening
 connection records, and validates the type and sizes of every map it opens. A
 missing or unsupported marker prevents BPF lookup and produces a warning; the

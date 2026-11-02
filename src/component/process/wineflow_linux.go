@@ -19,7 +19,7 @@ import (
 // not be passed just because that program's identity was unavailable.
 const WineUnknown = "wine-unknown"
 
-// The optional Windows identity maps from socketowner's experiments/wine,
+// The optional Windows identity maps from socketowner's wine,
 // pinned beside conn_owners with their own version.
 const (
 	wineFlowsMap     = "wine_flows"
