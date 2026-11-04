@@ -2,17 +2,25 @@
 GO ?= go
 PYTHON ?= python3
 BINDIR ?= $(CURDIR)/bin
-VERSION ?= $(shell git rev-parse --short HEAD)
+# Marked dirty when the tree, including the upstream pin, differs from the commit.
+VERSION ?= $(shell git describe --always --dirty --exclude='*')
 BUILDTIME ?= $(shell date -u)
 
 # Do not send make's attempt to remake its own input through the fallback.
 Makefile: ;
 
-.PHONY: prepare build test test-assembly test-process test-vm
+# Upstream's build targets run the go on PATH; use the toolchain GO names.
+GOROOT_BIN = $(shell $(GO) env GOROOT)/bin
+
+.PHONY: prepare build clean test test-assembly test-process test-vm
 prepare:
 	$(PYTHON) scripts/prepare-source.py
 
 build: linux-amd64
+
+# Only the assembly: bin/ may hold builds that are kept or deployed.
+clean:
+	rm -rf build
 
 test-assembly:
 	$(PYTHON) -m unittest discover -s tests -v
@@ -30,4 +38,4 @@ test-vm: prepare
 # Use upstream's build tags, architecture settings and linker flags, while
 # identifying the outer repository's source revision and keeping output in bin/.
 %: prepare
-	$(MAKE) -C build/mihomo $@ BINDIR="$(abspath $(BINDIR))" VERSION="$(VERSION)" BUILDTIME="$(BUILDTIME)"
+	PATH="$(GOROOT_BIN):$$PATH" $(MAKE) -C build/mihomo $@ BINDIR="$(abspath $(BINDIR))" VERSION="$(VERSION)" BUILDTIME="$(BUILDTIME)"

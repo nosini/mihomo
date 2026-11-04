@@ -19,10 +19,23 @@ def run(args, cwd):
     return result.stdout
 
 
-def copy_upstream(source, destination):
+def staged_pin(root):
+    """Return the upstream commit staged in the outer repository, if it has Git metadata."""
+    if not (root / '.git').exists():
+        return None
+    entry = run(['git', 'ls-files', '--stage', '--', 'upstream/mihomo'], root).split()
+    return entry[1] if entry and entry[0] == '160000' else None
+
+
+def copy_upstream(source, destination, pin=None):
     if not (source / 'go.mod').is_file() or not (source / 'main.go').is_file():
         raise RuntimeError('Upstream source missing; run git submodule update --init --recursive.')
     if (source / '.git').exists():
+        head = run(['git', 'rev-parse', 'HEAD'], source).strip()
+        if pin is not None and head != pin:
+            raise RuntimeError(
+                f'upstream/mihomo is at {head}, but the outer repository pins {pin}. '
+                'Run git submodule update, or stage a new pin with git add upstream/mihomo.')
         run(['git', 'diff', '--exit-code', 'HEAD', '--'], source)
         files = run(['git', 'ls-files', '-z'], source).split('\0')
         for filename in filter(None, files):
@@ -57,7 +70,7 @@ def prepare(root=ROOT):
     temporary = Path(tempfile.mkdtemp(prefix='.mihomo-', dir=build))
     previous = None
     try:
-        copy_upstream(root / 'upstream/mihomo', temporary)
+        copy_upstream(root / 'upstream/mihomo', temporary, staged_pin(root))
         for patch in sorted((root / 'patches').glob('*.patch')):
             run(['git', 'apply', '--no-index', '--check', str(patch)], temporary)
             run(['git', 'apply', '--no-index', str(patch)], temporary)

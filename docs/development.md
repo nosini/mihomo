@@ -22,7 +22,8 @@ bin/                Build output (including the privileged-test executable)
 `make prepare` copies committed upstream files into a fresh temporary directory,
 applies the patches and adds `src/` and `docs/`. It replaces `build/mihomo` only
 after assembly succeeds. Patch failures and files added upstream at one of our
-source paths require review. Dirty tracked files in the submodule are rejected;
+source paths require review. Dirty tracked files in the submodule are rejected,
+as is a submodule checkout other than the commit staged in the outer repository;
 untracked files are not copied. Source archives with Git metadata removed can
 also be assembled. The upstream submodule is never patched in place.
 
@@ -50,10 +51,11 @@ on a disposable machine with the separately installed loader, as described in
 
 Build commands delegate to upstream's Makefile, preserving its build tags,
 architecture choices and linker flags. Version and build time come from the
-outer repository and can be overridden with `VERSION=` and `BUILDTIME=`. Build
+outer repository, marked `-dirty` when its tree or upstream pin differs from the
+commit, and can be overridden with `VERSION=` and `BUILDTIME=`. Build
 output defaults to the outer `bin/` and can be overridden with `BINDIR=`.
-Choose a Go toolchain through `PATH` for upstream build targets; `GO=` also
-selects the executable used by this Makefile's Go test commands.
+`GO=` selects the Go toolchain for both tests and upstream build targets.
+`make clean` removes only `build/`, leaving binaries in `bin/`.
 
 ## Update upstream
 
@@ -62,11 +64,15 @@ Choose a specific upstream Alpha commit, then:
 ```sh
 git -C upstream/mihomo fetch origin Alpha
 git -C upstream/mihomo checkout --detach COMMIT
+git add upstream/mihomo
 make prepare
 make test
 make linux-amd64
-git add upstream/mihomo patches src docs
+git add patches src docs
 ```
+
+Assembly refuses a submodule checkout which differs from the staged pin, so stage
+the new pin before preparing it.
 
 Resolve patch or overlay conflicts in this repository and repeat validation.
 Review changes to upstream dependencies and build behavior as part of the

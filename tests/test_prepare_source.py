@@ -91,6 +91,29 @@ class AssemblyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'diff --exit-code'):
             assembler.prepare(self.root)
 
+    def stage_pin(self, commit):
+        subprocess.run(['git', 'init', '-q'], cwd=self.root, check=True)
+        subprocess.run(['git', 'update-index', '--add', '--cacheinfo',
+                        f'160000,{commit},upstream/mihomo'], cwd=self.root, check=True)
+
+    def test_checkout_matching_pin_is_assembled(self):
+        self.stage_pin(self.git('rev-parse', 'HEAD').strip())
+        output = assembler.prepare(self.root)
+        self.assertEqual((output / 'main.go').read_text(), 'package patched\n')
+
+    def test_checkout_away_from_pin_is_rejected(self):
+        pinned = self.git('rev-parse', 'HEAD').strip()
+        output = assembler.prepare(self.root)
+        before = self.snapshot(output)
+        self.stage_pin(pinned)
+        (self.upstream / 'later.go').write_text('package main\n')
+        self.git('add', 'later.go')
+        self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                 '-c', 'commit.gpgsign=false', 'commit', '-qm', 'later')
+        with self.assertRaisesRegex(RuntimeError, f'pins {pinned}'):
+            assembler.prepare(self.root)
+        self.assertEqual(self.snapshot(output), before)
+
     def test_archive_without_git_metadata_matches_checkout(self):
         output = assembler.prepare(self.root)
         expected = self.snapshot(output)
