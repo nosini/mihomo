@@ -15,7 +15,7 @@ import (
 )
 
 // Real pinned maps exercise the production reader's stale-record behavior:
-// stale positive records must remain WineUnknown rather than fall through to pasta.
+// stale positive records must remain WineUnknown rather than report no record.
 func TestWineFlowStalePublisher(t *testing.T) {
 	dir := fmt.Sprintf("/sys/fs/bpf/mihomo-wine-test-%d", os.Getpid())
 	if err := os.Mkdir(dir, 0700); err != nil {
@@ -66,9 +66,9 @@ func TestWineFlowStalePublisher(t *testing.T) {
 	put(heartbeat, unsafe.Pointer(&slot), unsafe.Pointer(&beat))
 	check := func(want string, covered bool) {
 		t.Helper()
-		uid, path, ok := lookupWineFlow("tcp", netip.MustParseAddr("127.0.0.1"), 4255)
-		if path != want || ok != covered || (ok && uid != value.UID) {
-			t.Fatalf("got uid=%d path=%q covered=%v; want %q covered=%v", uid, path, ok, want, covered)
+		path, ok := findWineProcess("tcp", netip.MustParseAddr("127.0.0.1"), 4255)
+		if path != want || ok != covered {
+			t.Fatalf("got path=%q covered=%v; want %q covered=%v", path, ok, want, covered)
 		}
 	}
 	check(`C:\Games\alpha.exe`, true)

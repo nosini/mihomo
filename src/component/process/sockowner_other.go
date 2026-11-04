@@ -2,6 +2,8 @@
 
 package process
 
+import "net/netip"
+
 var sockOwnerMapPath = DefaultSockOwnerMap
 
 // SetSockOwnerMap sets the pinned socket-owner map to use. The map is only
@@ -19,3 +21,8 @@ func SetSockOwnerOnly(only bool) { sockOwnerOnly = only }
 
 // SockOwnerOnly reports whether process lookup uses the BPF maps alone.
 func SockOwnerOnly() bool { return sockOwnerOnly }
+
+// Wine programs are identified only on Linux.
+func findWineProcess(network string, ip netip.Addr, srcPort int) (string, bool) {
+	return "", false
+}

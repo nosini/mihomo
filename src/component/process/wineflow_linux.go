@@ -133,11 +133,11 @@ func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, 
 	return value, live, true
 }
 
-// lookupWineFlow names the Windows program behind a flow. ok is false when no
-// Wine record covers it, and ordinary lookup should proceed. An unusable record
-// gives WineUnknown; falling through would report the relay or a reused port's
-// owner.
-func lookupWineFlow(network string, ip netip.Addr, srcPort int) (uid uint32, path string, ok bool) {
+// findWineProcess names the Windows program behind a flow, which is reported
+// beside the process owning the socket, such as a sandbox's relay. ok is false
+// when no Wine record covers it. An unusable record gives WineUnknown, so that
+// a rule for a Windows program is never passed for lack of its identity.
+func findWineProcess(network string, ip netip.Addr, srcPort int) (path string, ok bool) {
 	key := sockOwnerKey{Addr: ip.Unmap().As16(), Port: uint16(srcPort)}
 	switch {
 	case strings.HasPrefix(network, "tcp"):
@@ -145,7 +145,7 @@ func lookupWineFlow(network string, ip netip.Addr, srcPort int) (uid uint32, pat
 	case strings.HasPrefix(network, "udp"):
 		key.Proto = unix.IPPROTO_UDP
 	default:
-		return 0, "", false
+		return "", false
 	}
 	sockOwners.mu.RLock()
 	dir, netns := filepath.Dir(sockOwners.path), sockOwners.netns
@@ -154,22 +154,22 @@ func lookupWineFlow(network string, ip netip.Addr, srcPort int) (uid uint32, pat
 		// conn_owners has not been opened yet, which supplies the cookie.
 		var err error
 		if netns, err = currentNetnsCookie(); err != nil {
-			return 0, "", false
+			return "", false
 		}
 	}
 	key.Netns = netns
 	value, live, found := wineFlowMaps.lookup(&key, dir)
 	if !found {
-		return 0, "", false
+		return "", false
 	}
 	if !live || value.Status != wineStatusKnown || uint32(key.Proto) != value.Protocol {
-		return value.UID, WineUnknown, true
+		return WineUnknown, true
 	}
 	image, ok := wineImagePath(&value)
 	if !ok {
-		return value.UID, WineUnknown, true
+		return WineUnknown, true
 	}
-	return value.UID, image, true
+	return image, true
 }
 
 // wineImagePath decodes the image: a UTF-16 Windows path, or the filename alone

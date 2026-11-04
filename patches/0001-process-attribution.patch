@@ -1,5 +1,5 @@
 diff --git a/component/process/process.go b/component/process/process.go
-index 464f5a79b..a053fcba3 100644
+index 464f5a79b..f36b5547b 100644
 --- a/component/process/process.go
 +++ b/component/process/process.go
 @@ -3,6 +3,8 @@ package process
@@ -11,7 +11,7 @@ index 464f5a79b..a053fcba3 100644
  
  	C "github.com/metacubex/mihomo/constant"
  )
-@@ -18,10 +20,24 @@ const (
+@@ -18,10 +20,30 @@ const (
  	UDP = "udp"
  )
  
@@ -23,6 +23,12 @@ index 464f5a79b..a053fcba3 100644
  	return findProcessName(network, srcIP, srcPort)
  }
  
++// FindWineProcess returns the Windows program behind a connection relayed for
++// Wine, or WineUnknown. FindProcessName still names the socket's own process.
++func FindWineProcess(network string, srcIP netip.Addr, srcPort int) (string, bool) {
++	return findWineProcess(network, srcIP, srcPort)
++}
++
 +// ProcessBaseName returns the name of a process path from FindProcessName.
 +// Windows images keep their backslashes, which filepath.Base doesn't split on
 +// Linux, and rules name them like any other process.
@@ -37,16 +43,13 @@ index 464f5a79b..a053fcba3 100644
  // never change type traits because it's used in CMFA
  type PackageNameResolver func(metadata *C.Metadata) (string, error)
 diff --git a/component/process/process_linux.go b/component/process/process_linux.go
-index 2e36f6741..95c544ceb 100644
+index 2e36f6741..3ac6487b2 100644
 --- a/component/process/process_linux.go
 +++ b/component/process/process_linux.go
-@@ -63,6 +63,18 @@ type inetDiagResponse struct {
+@@ -63,6 +63,15 @@ type inetDiagResponse struct {
  }
  
  func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
-+	if uid, path, ok := lookupWineFlow(network, ip, srcPort); ok {
-+		return uid, path, nil
-+	}
 +	if owner, ok := lookupSockOwner(network, ip, srcPort); ok {
 +		if path, err := resolveSockOwnerPath(owner); err == nil {
 +			return owner.UID, path, nil
@@ -59,7 +62,7 @@ index 2e36f6741..95c544ceb 100644
  	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort)
  	if runtime.GOOS == "android" {
  		// on Android (especially recent releases), netlink INET_DIAG can fail or return UID 0 / empty process info for some apps
-@@ -179,7 +191,10 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
+@@ -179,7 +188,10 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
  	if err != nil {
  		return "", err
  	}
@@ -70,7 +73,7 @@ index 2e36f6741..95c544ceb 100644
  	buffer := make([]byte, unix.PathMax)
  	socket := fmt.Appendf(nil, "socket:[%d]", inode)
  
-@@ -190,6 +205,9 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
+@@ -190,6 +202,9 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
  
  		info, err := f.Info()
  		if err != nil {
@@ -119,8 +122,69 @@ index 707114a33..f3441fcf5 100644
  		GlobalUA:          cfg.GlobalUA,
  		ETagSupport:       cfg.ETagSupport,
  		KeepAliveIdle:     cfg.KeepAliveIdle,
+diff --git a/constant/metadata.go b/constant/metadata.go
+index 76d1e0e5c..c8b25a29e 100644
+--- a/constant/metadata.go
++++ b/constant/metadata.go
+@@ -217,6 +217,10 @@ type Metadata struct {
+ 	RawDstAddr net.Addr `json:"-"`
+ 	// Only domain rule
+ 	SniffHost string `json:"sniffHost"`
++
++	// The Windows program behind a Wine connection, beside the process owning its socket
++	WineProcess     string `json:"wineProcess,omitempty"`
++	WineProcessPath string `json:"wineProcessPath,omitempty"`
+ }
+ 
+ func (m *Metadata) RemoteAddress() string {
+@@ -236,6 +240,9 @@ func (m *Metadata) SourceDetail() string {
+ 		return fmt.Sprintf("%s", MihomoName)
+ 	}
+ 
++	if m.WineProcess != "" {
++		return fmt.Sprintf("%s(%s, wine=%s, uid=%d)", m.SourceAddress(), m.Process, m.WineProcess, m.Uid)
++	}
+ 	switch {
+ 	case m.Process != "" && m.Uid != 0:
+ 		return fmt.Sprintf("%s(%s, uid=%d)", m.SourceAddress(), m.Process, m.Uid)
+diff --git a/constant/rule.go b/constant/rule.go
+index 05ea8ebd3..f7e6d414c 100644
+--- a/constant/rule.go
++++ b/constant/rule.go
+@@ -40,6 +40,12 @@ const (
+ 	AND
+ 	OR
+ 	NOT
++	WineProcessName
++	WineProcessPath
++	WineProcessNameRegex
++	WineProcessPathRegex
++	WineProcessNameWildcard
++	WineProcessPathWildcard
+ )
+ 
+ type RuleType int
+@@ -118,6 +124,18 @@ func (rt RuleType) String() string {
+ 		return "OR"
+ 	case NOT:
+ 		return "NOT"
++	case WineProcessName:
++		return "WineProcessName"
++	case WineProcessPath:
++		return "WineProcessPath"
++	case WineProcessNameRegex:
++		return "WineProcessNameRegex"
++	case WineProcessPathRegex:
++		return "WineProcessPathRegex"
++	case WineProcessNameWildcard:
++		return "WineProcessNameWildcard"
++	case WineProcessPathWildcard:
++		return "WineProcessPathWildcard"
+ 	default:
+ 		return "Unknown"
+ 	}
 diff --git a/docs/config.yaml b/docs/config.yaml
-index 7e51bb882..21ce02d62 100644
+index 7e51bb882..9f40f7599 100644
 --- a/docs/config.yaml
 +++ b/docs/config.yaml
 @@ -25,6 +25,21 @@ lan-disallowed-ips: # 禁止连接的 IP 地址段，黑名单优先级高于白
@@ -145,6 +209,20 @@ index 7e51bb882..21ce02d62 100644
  mode: rule
  
  #自定义 geodata url
+@@ -1998,6 +2013,13 @@ rules:
+   - DOMAIN-WILDCARD,test.*.mihomo.com,ss1
+   - IP-CIDR,1.1.1.1/32,ss1
+   - IP-CIDR6,2409::/64,DIRECT
++  # Linux：socketowner 的 Wine 观察器运行时，WINE-PROCESS-* 匹配 Wine 连接背后的 Windows 程序，
++  # PROCESS-* 仍匹配持有套接字的进程（如沙箱的 pasta）。无法确定程序时为 wine-unknown
++  # Linux: with socketowner's Wine observer running, WINE-PROCESS-* match the Windows program
++  # behind a Wine connection, while PROCESS-* still match the process holding the socket (such as a
++  # sandbox's pasta). A program that can't be established is wine-unknown.
++  - AND,((PROCESS-NAME-REGEX,^game-pasta(\.avx2)?$),(WINE-PROCESS-NAME,game.exe)),DIRECT
++  - WINE-PROCESS-PATH-WILDCARD,C:\Games\*,DIRECT
+   # 当满足条件是 TCP 或 UDP 流量时，使用名为 sub-rule-name1 的规则集
+   - SUB-RULE,(OR,((NETWORK,TCP),(NETWORK,UDP))),sub-rule-name1
+   - SUB-RULE,(AND,((NETWORK,UDP))),sub-rule-name2
 diff --git a/hub/executor/executor.go b/hub/executor/executor.go
 index 796face2f..410bcd43b 100644
 --- a/hub/executor/executor.go
@@ -175,8 +253,66 @@ index 796face2f..410bcd43b 100644
  	resolver.DisableIPv6 = !general.IPv6
  
  	dialer.SetTcpConcurrent(general.TCPConcurrent)
+diff --git a/rules/common/process.go b/rules/common/process.go
+index 77c7b0e3b..823302520 100644
+--- a/rules/common/process.go
++++ b/rules/common/process.go
+@@ -37,15 +37,19 @@ func (ps *Process) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool,
+ 	switch ps.ruleType {
+ 	case C.ProcessName, C.ProcessNameRegex, C.ProcessNameWildcard:
+ 		target = metadata.Process
++	case C.WineProcessName, C.WineProcessNameRegex, C.WineProcessNameWildcard:
++		target = metadata.WineProcess
++	case C.WineProcessPath, C.WineProcessPathRegex, C.WineProcessPathWildcard:
++		target = metadata.WineProcessPath
+ 	default:
+ 		target = metadata.ProcessPath
+ 	}
+ 
+ 	switch ps.ruleType {
+-	case C.ProcessNameRegex, C.ProcessPathRegex:
++	case C.ProcessNameRegex, C.ProcessPathRegex, C.WineProcessNameRegex, C.WineProcessPathRegex:
+ 		match, _ := ps.regexp.MatchString(target)
+ 		return match, ps.adapter
+-	case C.ProcessNameWildcard, C.ProcessPathWildcard:
++	case C.ProcessNameWildcard, C.ProcessPathWildcard, C.WineProcessNameWildcard, C.WineProcessPathWildcard:
+ 		return wildcard.Match(strings.ToLower(ps.pattern), strings.ToLower(target)), ps.adapter
+ 	default:
+ 		return strings.EqualFold(target, ps.pattern), ps.adapter
+@@ -60,7 +64,7 @@ func NewProcess(pattern string, adapter string, ruleType C.RuleType) (*Process,
+ 		ruleType: ruleType,
+ 	}
+ 	switch ps.ruleType {
+-	case C.ProcessNameRegex, C.ProcessPathRegex:
++	case C.ProcessNameRegex, C.ProcessPathRegex, C.WineProcessNameRegex, C.WineProcessPathRegex:
+ 		r, err := regexp2.Compile(pattern, regexp2.IgnoreCase)
+ 		if err != nil {
+ 			return nil, err
+diff --git a/rules/parser.go b/rules/parser.go
+index 474d01ef4..b35a2647c 100644
+--- a/rules/parser.go
++++ b/rules/parser.go
+@@ -67,6 +67,18 @@ func ParseRule(tp, payload, target string, params []string, subRules map[string]
+ 		parsed, parseErr = RC.NewProcess(payload, target, C.ProcessNameWildcard)
+ 	case "PROCESS-PATH-WILDCARD":
+ 		parsed, parseErr = RC.NewProcess(payload, target, C.ProcessPathWildcard)
++	case "WINE-PROCESS-NAME":
++		parsed, parseErr = RC.NewProcess(payload, target, C.WineProcessName)
++	case "WINE-PROCESS-PATH":
++		parsed, parseErr = RC.NewProcess(payload, target, C.WineProcessPath)
++	case "WINE-PROCESS-NAME-REGEX":
++		parsed, parseErr = RC.NewProcess(payload, target, C.WineProcessNameRegex)
++	case "WINE-PROCESS-PATH-REGEX":
++		parsed, parseErr = RC.NewProcess(payload, target, C.WineProcessPathRegex)
++	case "WINE-PROCESS-NAME-WILDCARD":
++		parsed, parseErr = RC.NewProcess(payload, target, C.WineProcessNameWildcard)
++	case "WINE-PROCESS-PATH-WILDCARD":
++		parsed, parseErr = RC.NewProcess(payload, target, C.WineProcessPathWildcard)
+ 	case "NETWORK":
+ 		parsed, parseErr = RC.NewNetworkType(payload, target)
+ 	case "UID":
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 86dbc14ae..df20b9acf 100644
+index 86dbc14ae..aa3e2d145 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
 @@ -6,7 +6,6 @@ import (
@@ -196,3 +332,15 @@ index 86dbc14ae..df20b9acf 100644
  						metadata.ProcessPath = path
  						metadata.Uid = uid
  
+@@ -365,6 +364,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 							metadata.Process = pkg
+ 						}
+ 					}
++					// A Wine program is known even when its relay's owner isn't.
++					if path, ok := process.FindWineProcess(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort)); ok {
++						metadata.WineProcess = process.ProcessBaseName(path)
++						metadata.WineProcessPath = path
++					}
+ 				} else {
+ 					// check package names
+ 					pkg, err := process.FindPackageName(metadata)
