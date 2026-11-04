@@ -66,7 +66,7 @@ func TestWineFlowStalePublisher(t *testing.T) {
 	put(heartbeat, unsafe.Pointer(&slot), unsafe.Pointer(&beat))
 	check := func(want string, covered bool) {
 		t.Helper()
-		path, ok := findWineProcess("tcp", netip.MustParseAddr("127.0.0.1"), 4255)
+		_, path, ok := findWineProcess("tcp", netip.MustParseAddr("127.0.0.1"), 4255)
 		if path != want || ok != covered {
 			t.Fatalf("got path=%q covered=%v; want %q covered=%v", path, ok, want, covered)
 		}

@@ -24,33 +24,49 @@ func wineValue(image string) *wineFlowValue {
 	return v
 }
 
-func TestWineImagePath(t *testing.T) {
-	path, ok := wineImagePath(wineValue(`\??\C:\Program Files\Game\Tbs_Browser.exe`))
-	assert.True(t, ok)
-	assert.Equal(t, `C:\Program Files\Game\Tbs_Browser.exe`, path)
-	assert.Equal(t, "Tbs_Browser.exe", ProcessBaseName(path))
-	assert.Equal(t, "firefox", ProcessBaseName("/usr/bin/firefox"))
-	assert.Equal(t, WineUnknown, ProcessBaseName(WineUnknown))
+func TestWineImage(t *testing.T) {
+	for image, want := range map[string][2]string{
+		`\??\C:\Program Files\Game\Tbs_Browser.exe`: {"Tbs_Browser.exe", `C:\Program Files\Game\Tbs_Browser.exe`},
+		`\\?\d:/games/alpha.exe`:                    {"alpha.exe", `d:\games\alpha.exe`},
+		`\??\UNC\srv\share\game.exe`:                {"game.exe", `\\srv\share\game.exe`},
+		`\\srv\share\dir\game.exe`:                  {"game.exe", `\\srv\share\dir\game.exe`},
+		"C:\\Games\\\U0001F3AE.exe":                 {"\U0001F3AE.exe", "C:\\Games\\\U0001F3AE.exe"},
+	} {
+		name, path, ok := wineImage(wineValue(image))
+		assert.True(t, ok, image)
+		assert.Equal(t, want, [2]string{name, path}, image)
+	}
 
 	mapped := &wineFlowValue{Encoding: 1, ImageBytes: 9}
 	for i, b := range []byte("alpha.exe") {
 		mapped.Image[i/2] |= uint16(b) << (8 * (i % 2))
 	}
-	path, ok = wineImagePath(mapped)
+	name, path, ok := wineImage(mapped)
 	assert.True(t, ok)
+	assert.Equal(t, "alpha.exe", name)
 	assert.Equal(t, "alpha.exe", path)
-	assert.Equal(t, "alpha.exe", ProcessBaseName(path))
 
+	lowSurrogate := wineValue(`C:\a.exe`)
+	lowSurrogate.Image[4] = 0xdc00
 	for name, v := range map[string]*wineFlowValue{
-		"encoding":  {Encoding: 2, ImageBytes: 2},
-		"unnamed":   {Encoding: 1},
-		"empty":     {},
-		"odd":       {ImageBytes: 3},
-		"oversized": {ImageBytes: wineImageBytes + 2},
-		"nul":       wineValue("C:\\a\x00b.exe"),
-		"surrogate": {ImageBytes: 2, Image: [wineImageBytes / 2]uint16{0xd800}},
+		"encoding":       {Encoding: 2, ImageBytes: 2},
+		"unnamed":        {Encoding: 1},
+		"mapped dot":     {Encoding: 1, ImageBytes: 1, Image: [wineImageBytes / 2]uint16{'.'}},
+		"empty":          {},
+		"odd":            {ImageBytes: 3},
+		"oversized":      {ImageBytes: wineImageBytes + 2},
+		"nul":            wineValue("C:\\a\x00b.exe"),
+		"surrogate":      {ImageBytes: 2, Image: [wineImageBytes / 2]uint16{0xd800}},
+		"low surrogate":  lowSurrogate,
+		"relative":       wineValue(`Games\game.exe`),
+		"drive relative": wineValue(`C:game.exe`),
+		"basename only":  wineValue(`game.exe`),
+		"directory":      wineValue(`C:\Games\`),
+		"dot dot":        wineValue(`C:\Games\..`),
+		"bare UNC":       wineValue(`\??\UNC\srv\share`),
+		"empty server":   wineValue(`\\\share\game.exe`),
 	} {
-		_, ok := wineImagePath(v)
+		_, _, ok := wineImage(v)
 		assert.False(t, ok, name)
 	}
 }

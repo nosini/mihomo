@@ -33,28 +33,30 @@ const (
 )
 
 type wineFlowValue struct {
-	SocketID         uint64
-	ServerStartNs    uint64
-	ClientStartNs    uint64
-	CapturedBootNs   uint64
-	ServerTgid       uint32
-	UID              uint32
-	WindowsPID       uint32
-	ClientTgid       uint32
-	Status           uint32
-	ImageBytes       uint32
-	Protocol         uint32
-	Encoding         uint32
-	Image            [wineImageBytes / 2]uint16
+	SocketID       uint64
+	ServerStartNs  uint64
+	ClientStartNs  uint64
+	CapturedBootNs uint64
+	ServerTgid     uint32
+	UID            uint32
+	WindowsPID     uint32
+	ClientTgid     uint32
+	Status         uint32
+	ImageBytes     uint32
+	Protocol       uint32
+	Encoding       uint32
+	Image          [wineImageBytes / 2]uint16
 }
 
 // wineFlows opens its maps as sockOwners does, separately: they come and go
-// with one sandbox's publisher, not with the socketowner loader.
+// with one sandbox's publisher, not with the socketowner loader. netns is
+// mihomo's network namespace cookie, which keys the records as in conn_owners.
 type wineFlows struct {
 	mu          sync.RWMutex
 	flowsFd     int
 	heartbeatFd int
 	ino         uint64
+	netns       uint64
 	checkedAt   time.Time
 }
 
@@ -93,6 +95,10 @@ func (w *wineFlows) refreshLocked(dir string) {
 	if !lookupBPFMap(version, &key, &abi) || abi != wineABIVersion {
 		return
 	}
+	netns, err := currentNetnsCookie()
+	if err != nil {
+		return
+	}
 	heartbeat, err := openBPFMap(filepath.Join(dir, wineHeartbeatMap), unix.BPF_MAP_TYPE_ARRAY, 4, uint64(0))
 	if err != nil {
 		return
@@ -103,11 +109,12 @@ func (w *wineFlows) refreshLocked(dir string) {
 		unix.Close(heartbeat)
 		return
 	}
-	w.flowsFd, w.heartbeatFd, w.ino = flows, heartbeat, st.Ino
+	w.flowsFd, w.heartbeatFd, w.ino, w.netns = flows, heartbeat, st.Ino, netns
 }
 
-// lookup returns the record of a flow. live is false if its publisher stopped
-// beating, which leaves records unmaintained: a port may have changed hands.
+// lookup returns the record of a flow, given its key without the namespace.
+// live is false if its publisher stopped beating, which leaves records
+// unmaintained: a port may have changed hands.
 func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, live, found bool) {
 	w.mu.RLock()
 	stale := time.Since(w.checkedAt) >= sockOwnerMissRecheck
@@ -121,7 +128,11 @@ func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, 
 	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	if w.flowsFd < 0 || !lookupBPFMap(w.flowsFd, key, &value) {
+	if w.flowsFd < 0 {
+		return value, false, false
+	}
+	key.Netns = w.netns
+	if !lookupBPFMap(w.flowsFd, key, &value) {
 		return value, false, false
 	}
 	var slot uint32
@@ -137,7 +148,7 @@ func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, 
 // beside the process owning the socket, such as a sandbox's relay. ok is false
 // when no Wine record covers it. An unusable record gives WineUnknown, so that
 // a rule for a Windows program is never passed for lack of its identity.
-func findWineProcess(network string, ip netip.Addr, srcPort int) (path string, ok bool) {
+func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path string, ok bool) {
 	key := sockOwnerKey{Addr: ip.Unmap().As16(), Port: uint16(srcPort)}
 	switch {
 	case strings.HasPrefix(network, "tcp"):
@@ -145,60 +156,78 @@ func findWineProcess(network string, ip netip.Addr, srcPort int) (path string, o
 	case strings.HasPrefix(network, "udp"):
 		key.Proto = unix.IPPROTO_UDP
 	default:
-		return "", false
+		return "", "", false
 	}
 	sockOwners.mu.RLock()
-	dir, netns := filepath.Dir(sockOwners.path), sockOwners.netns
+	dir := filepath.Dir(sockOwners.path)
 	sockOwners.mu.RUnlock()
-	if netns == 0 {
-		// conn_owners has not been opened yet, which supplies the cookie.
-		var err error
-		if netns, err = currentNetnsCookie(); err != nil {
-			return "", false
-		}
-	}
-	key.Netns = netns
 	value, live, found := wineFlowMaps.lookup(&key, dir)
 	if !found {
-		return "", false
+		return "", "", false
 	}
 	if !live || value.Status != wineStatusKnown || uint32(key.Proto) != value.Protocol {
-		return WineUnknown, true
+		return WineUnknown, WineUnknown, true
 	}
-	image, ok := wineImagePath(&value)
-	if !ok {
-		return WineUnknown, true
+	if name, path, ok = wineImage(&value); !ok {
+		return WineUnknown, WineUnknown, true
 	}
-	return image, true
+	return name, path, true
 }
 
-// wineImagePath decodes the image: a UTF-16 Windows path, or the filename alone
-// in bytes for clients with no reachable path. socketowner published it only
-// after checking the length; a reader of a shared ABI checks again.
-func wineImagePath(value *wineFlowValue) (string, bool) {
+// wineImage decodes the image as socketowner does: an absolute UTF-16 Windows
+// drive or UNC path, or the filename alone in bytes for clients with no
+// reachable path. socketowner published it only after checking it; a reader of
+// a shared ABI checks again, so that a malformed image is never a usable name.
+func wineImage(value *wineFlowValue) (name, path string, ok bool) {
 	size := value.ImageBytes
 	if value.Encoding == 1 {
 		if size == 0 || size > wineImageBytes {
-			return "", false
+			return "", "", false
 		}
-		name := make([]byte, 0, size+1)
+		raw := make([]byte, 0, size+1)
 		for _, w := range value.Image[:(size+1)/2] {
-			name = append(name, byte(w), byte(w>>8))
+			raw = append(raw, byte(w), byte(w>>8))
 		}
-		image := string(name[:size])
-		if !utf8.ValidString(image) || strings.ContainsAny(image, "\x00/\\") {
-			return "", false
+		name = string(raw[:size])
+		if !utf8.ValidString(name) || strings.ContainsAny(name, "\x00/\\") || name == "." || name == ".." {
+			return "", "", false
 		}
-		return image, true
+		return name, name, true
 	}
 	if value.Encoding != 0 || size < 2 || size > wineImageBytes || size%2 != 0 {
-		return "", false
+		return "", "", false
 	}
-	image := string(utf16.Decode(value.Image[:size/2]))
-	if strings.ContainsRune(image, 0) || strings.ContainsRune(image, 0xfffd) {
-		return "", false
+	w := value.Image[:size/2]
+	for i := 0; i < len(w); i++ {
+		switch c := w[i]; {
+		case c == 0:
+			return "", "", false
+		case c >= 0xd800 && c <= 0xdbff:
+			if i+1 == len(w) || w[i+1] < 0xdc00 || w[i+1] > 0xdfff {
+				return "", "", false
+			}
+			i++
+		case c >= 0xdc00 && c <= 0xdfff:
+			return "", "", false
+		}
 	}
-	image = strings.ReplaceAll(image, "/", `\`)
-	image = strings.TrimPrefix(strings.TrimPrefix(image, `\??\`), `\\?\`)
-	return image, true
+	path = strings.ReplaceAll(string(utf16.Decode(w)), "/", `\`)
+	path = strings.TrimPrefix(strings.TrimPrefix(path, `\??\`), `\\?\`)
+	if strings.HasPrefix(path, `UNC\`) {
+		path = `\\` + path[4:]
+	}
+	drive := len(path) >= 3 && (path[0] >= 'A' && path[0] <= 'Z' || path[0] >= 'a' && path[0] <= 'z') && path[1:3] == `:\`
+	unc := false
+	if strings.HasPrefix(path, `\\`) {
+		parts := strings.Split(path[2:], `\`)
+		unc = len(parts) >= 3 && parts[0] != "" && parts[1] != ""
+	}
+	if !drive && !unc {
+		return "", "", false
+	}
+	name = path[strings.LastIndexByte(path, '\\')+1:]
+	if name == "" || name == "." || name == ".." {
+		return "", "", false
+	}
+	return name, path, true
 }

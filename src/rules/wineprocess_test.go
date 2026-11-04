@@ -1,10 +1,12 @@
 package rules_test
 
 import (
+	"strings"
 	"testing"
 
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/rules"
+	RC "github.com/metacubex/mihomo/rules/common"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -55,7 +57,29 @@ func TestWineProcessRules(t *testing.T) {
 	}
 }
 
+// Regexes may contain commas, which the rule line's own commas must not split.
+func TestWineProcessRegexWithComma(t *testing.T) {
+	m := &C.Metadata{WineProcess: "alphabeta.exe", WineProcessPath: `C:\Games\alphabeta.exe`}
+	for _, line := range []string{
+		`WINE-PROCESS-NAME-REGEX,^(alpha|beta){1,2}\.exe$,REJECT`,
+		`WINE-PROCESS-PATH-REGEX,^C:\\Games\\(alpha|beta){1,2}\.exe$,REJECT`,
+		`AND,((WINE-PROCESS-NAME-REGEX,^(alpha|beta){1,2}\.exe$),(WINE-PROCESS-PATH-REGEX,^C:\\(Games|Apps){1,1}\\)),REJECT`,
+	} {
+		tp, payload, target, params := RC.ParseRulePayload(line, true)
+		rule, err := rules.ParseRule(tp, payload, target, params, nil)
+		if !assert.NoError(t, err, line) {
+			continue
+		}
+		matched, adapter := rule.Match(m, C.RuleMatchHelper{})
+		assert.True(t, matched, line)
+		assert.Equal(t, "REJECT", adapter, line)
+	}
+}
+
 func TestWineProcessSourceDetail(t *testing.T) {
 	m := &C.Metadata{Process: "game-pasta", WineProcess: "game.exe", Uid: 1000}
 	assert.Contains(t, m.SourceDetail(), "(game-pasta, wine=game.exe, uid=1000)")
+	// The Wine record can be found when the socket's owner isn't.
+	m = &C.Metadata{WineProcess: "game.exe"}
+	assert.True(t, strings.HasSuffix(m.SourceDetail(), "(wine=game.exe)"), m.SourceDetail())
 }

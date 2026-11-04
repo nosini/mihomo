@@ -1,17 +1,8 @@
 diff --git a/component/process/process.go b/component/process/process.go
-index 464f5a79b..f36b5547b 100644
+index 464f5a79b..18a8003c7 100644
 --- a/component/process/process.go
 +++ b/component/process/process.go
-@@ -3,6 +3,8 @@ package process
- import (
- 	"errors"
- 	"net/netip"
-+	"path/filepath"
-+	"strings"
- 
- 	C "github.com/metacubex/mihomo/constant"
- )
-@@ -18,10 +20,30 @@ const (
+@@ -18,10 +18,21 @@ const (
  	UDP = "udp"
  )
  
@@ -23,20 +14,11 @@ index 464f5a79b..f36b5547b 100644
  	return findProcessName(network, srcIP, srcPort)
  }
  
-+// FindWineProcess returns the Windows program behind a connection relayed for
-+// Wine, or WineUnknown. FindProcessName still names the socket's own process.
-+func FindWineProcess(network string, srcIP netip.Addr, srcPort int) (string, bool) {
++// FindWineProcess returns the name and Windows path of the program behind a
++// connection relayed for Wine, or WineUnknown for both. FindProcessName still
++// names the socket's own process.
++func FindWineProcess(network string, srcIP netip.Addr, srcPort int) (name, path string, ok bool) {
 +	return findWineProcess(network, srcIP, srcPort)
-+}
-+
-+// ProcessBaseName returns the name of a process path from FindProcessName.
-+// Windows images keep their backslashes, which filepath.Base doesn't split on
-+// Linux, and rules name them like any other process.
-+func ProcessBaseName(path string) string {
-+	if i := strings.LastIndexByte(path, '\\'); i >= 0 {
-+		return path[i+1:]
-+	}
-+	return filepath.Base(path)
 +}
 +
  // PackageNameResolver
@@ -123,7 +105,7 @@ index 707114a33..f3441fcf5 100644
  		ETagSupport:       cfg.ETagSupport,
  		KeepAliveIdle:     cfg.KeepAliveIdle,
 diff --git a/constant/metadata.go b/constant/metadata.go
-index 76d1e0e5c..c8b25a29e 100644
+index 76d1e0e5c..cc7a531b4 100644
 --- a/constant/metadata.go
 +++ b/constant/metadata.go
 @@ -217,6 +217,10 @@ type Metadata struct {
@@ -137,12 +119,19 @@ index 76d1e0e5c..c8b25a29e 100644
  }
  
  func (m *Metadata) RemoteAddress() string {
-@@ -236,6 +240,9 @@ func (m *Metadata) SourceDetail() string {
+@@ -236,6 +240,16 @@ func (m *Metadata) SourceDetail() string {
  		return fmt.Sprintf("%s", MihomoName)
  	}
  
 +	if m.WineProcess != "" {
-+		return fmt.Sprintf("%s(%s, wine=%s, uid=%d)", m.SourceAddress(), m.Process, m.WineProcess, m.Uid)
++		detail := "wine=" + m.WineProcess
++		if m.Process != "" {
++			detail = m.Process + ", " + detail
++		}
++		if m.Uid != 0 {
++			detail += fmt.Sprintf(", uid=%d", m.Uid)
++		}
++		return fmt.Sprintf("%s(%s)", m.SourceAddress(), detail)
 +	}
  	switch {
  	case m.Process != "" && m.Uid != 0:
@@ -253,6 +242,20 @@ index 796face2f..410bcd43b 100644
  	resolver.DisableIPv6 = !general.IPv6
  
  	dialer.SetTcpConcurrent(general.TCPConcurrent)
+diff --git a/rules/common/base.go b/rules/common/base.go
+index 33ab5a1f3..e4cb6adff 100644
+--- a/rules/common/base.go
++++ b/rules/common/base.go
+@@ -52,7 +52,8 @@ func ParseRulePayload(ruleRaw string, needTarget bool) (tp, payload, target stri
+ 		case "MATCH":
+ 			// MATCH doesn't contain payload and params
+ 			target = item[1]
+-		case "NOT", "OR", "AND", "SUB-RULE", "DOMAIN-REGEX", "PROCESS-NAME-REGEX", "PROCESS-PATH-REGEX":
++		case "NOT", "OR", "AND", "SUB-RULE", "DOMAIN-REGEX", "PROCESS-NAME-REGEX", "PROCESS-PATH-REGEX",
++			"WINE-PROCESS-NAME-REGEX", "WINE-PROCESS-PATH-REGEX":
+ 			// some type of rules that has comma in payload and don't need params
+ 			if needTarget {
+ 				l := len(item)
 diff --git a/rules/common/process.go b/rules/common/process.go
 index 77c7b0e3b..823302520 100644
 --- a/rules/common/process.go
@@ -312,33 +315,16 @@ index 474d01ef4..b35a2647c 100644
  		parsed, parseErr = RC.NewNetworkType(payload, target)
  	case "UID":
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 86dbc14ae..aa3e2d145 100644
+index 86dbc14ae..ebbe79f41 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
-@@ -6,7 +6,6 @@ import (
- 	"fmt"
- 	"net"
- 	"net/netip"
--	"path/filepath"
- 	"runtime"
- 	"strings"
- 	"sync"
-@@ -357,7 +356,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
- 					if err != nil {
- 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
- 					} else {
--						metadata.Process = filepath.Base(path)
-+						metadata.Process = process.ProcessBaseName(path)
- 						metadata.ProcessPath = path
- 						metadata.Uid = uid
- 
-@@ -365,6 +364,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+@@ -365,6 +365,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
  							metadata.Process = pkg
  						}
  					}
 +					// A Wine program is known even when its relay's owner isn't.
-+					if path, ok := process.FindWineProcess(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort)); ok {
-+						metadata.WineProcess = process.ProcessBaseName(path)
++					if name, path, ok := process.FindWineProcess(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort)); ok {
++						metadata.WineProcess = name
 +						metadata.WineProcessPath = path
 +					}
  				} else {

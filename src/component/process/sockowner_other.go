@@ -23,6 +23,6 @@ func SetSockOwnerOnly(only bool) { sockOwnerOnly = only }
 func SockOwnerOnly() bool { return sockOwnerOnly }
 
 // Wine programs are identified only on Linux.
-func findWineProcess(network string, ip netip.Addr, srcPort int) (string, bool) {
-	return "", false
+func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path string, ok bool) {
+	return "", "", false
 }
