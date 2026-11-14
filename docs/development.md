@@ -24,14 +24,25 @@ applies the patches and adds `src/` and `docs/`. It replaces `build/mihomo` only
 after assembly succeeds. Patch failures and files added upstream at one of our
 source paths require review. Dirty tracked files in the submodule are rejected,
 as is a submodule checkout other than the commit staged in the outer repository;
-untracked files are not copied. Source archives with Git metadata removed can
-also be assembled. The upstream submodule is never patched in place.
+untracked upstream files are not copied. When the outer checkout has Git
+metadata, only tracked files under `src/`, `docs/` and `patches/` are assembled,
+using their working-tree content. Untracked, ignored and editor backup files are
+left out. Source archives with Git metadata removed can also be assembled; they
+copy the files that are present, skipping `__pycache__`, `*.pyc`, `*~` and
+`.*.swp`. The upstream submodule is never patched in place.
+
+Assembly records a hash of the upstream revision, patch contents, overlaid files
+and this script in `build/.mihomo.stamp`. If `build/mihomo` exists and that
+stamp still matches, `make prepare` skips assembly;
+`python3 scripts/prepare-source.py --force` always reassembles. The upstream
+dirty-tree and pin checks still run before deciding to skip.
 
 Edit additions in `src/`. To change an integration patch, edit the relevant file
 in a prepared `build/mihomo`, compare it against the pinned upstream file and
-update the patch. Running `make prepare` again replaces edits in the assembly.
-Our internal Go tests live beside their package sources in `src/` and are copied
-to the same package directories as upstream.
+update the patch. Running `make prepare` replaces the assembly when its inputs
+change; use `--force` to discard edits made only in `build/mihomo`. Our internal
+Go tests live beside their package sources in `src/` and are copied to the same
+package directories as upstream.
 
 ## Build and test
 
@@ -51,8 +62,10 @@ on a disposable machine with the separately installed loader, as described in
 
 Build commands delegate to upstream's Makefile, preserving its build tags,
 architecture choices and linker flags. Version and build time come from the
-outer repository, marked `-dirty` when its tree or upstream pin differs from the
-commit, and can be overridden with `VERSION=` and `BUILDTIME=`. Build
+outer repository when it is a Git checkout, marked `-dirty` when its tracked
+tree or upstream pin differs from the commit. An archive without Git metadata,
+or a checkout inside an unrelated enclosing repository, reports the version as
+`unknown`. Both values can be overridden with `VERSION=` and `BUILDTIME=`. Build
 output defaults to the outer `bin/` and can be overridden with `BINDIR=`.
 `GO=` selects the Go toolchain for both tests and upstream build targets.
 `make clean` removes only `build/`, leaving binaries in `bin/`.

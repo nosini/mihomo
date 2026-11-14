@@ -46,6 +46,7 @@ class AssemblyTests(unittest.TestCase):
         return {str(p.relative_to(root)): p.read_bytes()
                 for p in root.rglob('*') if p.is_file()}
 
+    @unittest.skipUnless((ROOT / '.git').exists(), 'requires a Git checkout')
     def test_assembly_leaves_upstream_and_outer_index_unchanged(self):
         index = Path(subprocess.check_output(
             ['git', 'rev-parse', '--git-path', 'index'], cwd=ROOT, text=True).strip())
@@ -63,6 +64,26 @@ class AssemblyTests(unittest.TestCase):
         self.assertEqual(self.git('status', '--porcelain', '--untracked-files=no'), '')
         self.assertEqual(index.read_bytes(), original_index)
 
+    def test_untracked_addition_is_not_assembled_from_git_checkout(self):
+        self.outer_git('init', '-q')
+        self.outer_git('add', 'src', 'docs', 'patches')
+        self.outer_git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                       '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture')
+        (self.root / 'src/untracked.go').write_text('package main\n// untracked\n')
+        output = assembler.prepare(self.root)
+        self.assertTrue((output / 'extra.go').is_file())
+        self.assertTrue((output / 'docs/local.md').is_file())
+        self.assertFalse((output / 'untracked.go').exists())
+
+    def test_unchanged_inputs_skip_assembly_until_forced(self):
+        output = assembler.prepare(self.root)
+        marker = output / 'marker'
+        marker.write_text('kept\n')
+        assembler.prepare(self.root)
+        self.assertTrue(marker.is_file())
+        assembler.prepare(self.root, force=True)
+        self.assertFalse(marker.exists())
+
     def test_deleted_addition_disappears_on_next_prepare(self):
         output = assembler.prepare(self.root)
         (self.root / 'src/extra.go').unlink()
@@ -76,7 +97,8 @@ class AssemblyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             assembler.prepare(self.root)
         self.assertEqual(self.snapshot(output), before)
-        self.assertEqual(sorted(p.name for p in (self.root / 'build').iterdir()), ['mihomo'])
+        self.assertEqual(sorted(p.name for p in (self.root / 'build').iterdir()),
+                         ['.mihomo.stamp', 'mihomo'])
 
     def test_upstream_collision_preserves_last_good_assembly(self):
         output = assembler.prepare(self.root)
@@ -86,15 +108,23 @@ class AssemblyTests(unittest.TestCase):
             assembler.prepare(self.root)
         self.assertEqual(self.snapshot(output), before)
 
-    def test_dirty_submodule_is_rejected(self):
+    def test_dirty_submodule_is_rejected_even_when_stamp_matches(self):
+        output = assembler.prepare(self.root)
+        before = self.snapshot(output)
         (self.upstream / 'main.go').write_text('unreviewed\n')
         with self.assertRaisesRegex(RuntimeError, 'diff --exit-code'):
             assembler.prepare(self.root)
+        self.assertEqual(self.snapshot(output), before)
+
+    def outer_git(self, *arguments):
+        return subprocess.check_output(['git', *arguments], cwd=self.root,
+                                       stderr=subprocess.STDOUT, text=True)
 
     def stage_pin(self, commit):
-        subprocess.run(['git', 'init', '-q'], cwd=self.root, check=True)
-        subprocess.run(['git', 'update-index', '--add', '--cacheinfo',
-                        f'160000,{commit},upstream/mihomo'], cwd=self.root, check=True)
+        self.outer_git('init', '-q')
+        self.outer_git('add', 'src', 'docs', 'patches')
+        self.outer_git('update-index', '--add', '--cacheinfo',
+                       f'160000,{commit},upstream/mihomo')
 
     def test_checkout_matching_pin_is_assembled(self):
         self.stage_pin(self.git('rev-parse', 'HEAD').strip())

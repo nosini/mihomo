@@ -2,8 +2,10 @@
 GO ?= go
 PYTHON ?= python3
 BINDIR ?= $(CURDIR)/bin
-# Marked dirty when the tree, including the upstream pin, differs from the commit.
-VERSION ?= $(shell git describe --always --dirty --exclude='*')
+# Marked dirty when tracked build inputs differ from the commit; untracked files
+# are not assembled when this checkout has Git metadata. Source archives and
+# enclosing unrelated repositories have no version to report.
+VERSION ?= $(shell if [ "$$(git -C '$(CURDIR)' rev-parse --show-toplevel 2>/dev/null)" = '$(CURDIR)' ]; then git -C '$(CURDIR)' describe --always --dirty --exclude='*' 2>/dev/null || echo unknown; else echo unknown; fi)
 BUILDTIME ?= $(shell date -u)
 
 # Do not send make's attempt to remake its own input through the fallback.
