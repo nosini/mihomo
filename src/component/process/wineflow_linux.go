@@ -139,7 +139,10 @@ func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, 
 	var beat uint64
 	var now unix.Timespec
 	if lookupBPFMap(w.heartbeatFd, &slot, &beat) && unix.ClockGettime(unix.CLOCK_BOOTTIME, &now) == nil {
-		live = now.Nano()-int64(beat) < int64(wineHeartbeatLimit)
+		// The publisher writes host CLOCK_BOOTTIME. A beat from the future
+		// means another clock (a time namespace), so it proves nothing.
+		age := now.Nano() - int64(beat)
+		live = age >= 0 && age < int64(wineHeartbeatLimit)
 	}
 	return value, live, true
 }
@@ -184,9 +187,9 @@ func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path str
 
 // wineImage decodes the image as socketowner does: an absolute UTF-16 Windows
 // drive or UNC path, or for 32-bit clients only the filename in bytes, with no
-// reachable Windows path. socketowner published it only after checking it; a
-// reader of a shared ABI checks again, so that a malformed image is never a
-// usable name.
+// reachable Windows path. BPF copies it from the client's memory unchecked, so
+// it is validated here as socketowner's observer validates it, and a malformed
+// image is never a usable name.
 func wineImage(value *wineFlowValue) (name, path string, ok bool) {
 	size := value.ImageBytes
 	if value.Encoding == 1 {
@@ -221,8 +224,15 @@ func wineImage(value *wineFlowValue) (name, path string, ok bool) {
 		}
 	}
 	path = strings.ReplaceAll(string(utf16.Decode(w)), "/", `\`)
-	path = strings.TrimPrefix(strings.TrimPrefix(path, `\??\`), `\\?\`)
-	if strings.HasPrefix(path, `UNC\`) {
+	// Only an NT or Win32 device prefix makes a following UNC\ a share path; a
+	// bare UNC\ is relative.
+	stripped := false
+	if t := strings.TrimPrefix(path, `\??\`); t != path {
+		path, stripped = t, true
+	} else if t := strings.TrimPrefix(path, `\\?\`); t != path {
+		path, stripped = t, true
+	}
+	if stripped && strings.HasPrefix(path, `UNC\`) {
 		path = `\\` + path[4:]
 	}
 	drive := len(path) >= 3 && (path[0] >= 'A' && path[0] <= 'Z' || path[0] >= 'a' && path[0] <= 'z') && path[1:3] == `:\`

@@ -64,6 +64,7 @@ func TestWineImage(t *testing.T) {
 		"directory":      wineValue(`C:\Games\`),
 		"dot dot":        wineValue(`C:\Games\..`),
 		"bare UNC":       wineValue(`\??\UNC\srv\share`),
+		"relative UNC":   wineValue(`UNC\srv\share\game.exe`),
 		"empty server":   wineValue(`\\\share\game.exe`),
 	} {
 		_, _, ok := wineImage(v)
