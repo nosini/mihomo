@@ -44,7 +44,7 @@ func TestWineImage(t *testing.T) {
 	name, path, ok := wineImage(mapped)
 	assert.True(t, ok)
 	assert.Equal(t, "alpha.exe", name)
-	assert.Equal(t, "alpha.exe", path)
+	assert.Equal(t, "", path)
 
 	lowSurrogate := wineValue(`C:\a.exe`)
 	lowSurrogate.Image[4] = 0xdc00
@@ -68,5 +68,23 @@ func TestWineImage(t *testing.T) {
 	} {
 		_, _, ok := wineImage(v)
 		assert.False(t, ok, name)
+	}
+}
+
+func TestWineFlowsDir(t *testing.T) {
+	for owner, want := range map[string]struct {
+		dir     string
+		enabled bool
+	}{
+		"":                                    {"", false},
+		"conn_owners":                         {".", true},
+		"maps/conn_owners":                    {"maps", true},
+		"/sys/fs/bpf/mihomo/maps/conn_owners": {"/sys/fs/bpf/mihomo/maps", true},
+	} {
+		dir, enabled := wineFlowsDir(owner)
+		assert.Equal(t, want, struct {
+			dir     string
+			enabled bool
+		}{dir, enabled}, owner)
 	}
 }

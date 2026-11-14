@@ -50,6 +50,14 @@ rules refusing a Windows program before it. 32-bit clients have a name but no
 Windows path. The reader and observer are available on their respective `main`
 branches.
 
+socketowner records host process IDs, so the reader only resolves process
+paths when mihomo runs in the initial PID namespace. In a nested PID namespace
+it still reports the owner's UID, but leaves the process name and path empty
+and logs one warning instead of looking up an unrelated process.
+
+This build also disables the hub's core self-update (`POST /upgrade`), which
+would replace it with stock MetaCubeX. Geo database updates are unchanged.
+
 The reader requires `abi_version` beside `conn_owners`, checks its value before opening
 connection records, and validates the type and sizes of every map it opens. A
 missing or unsupported marker prevents BPF lookup and produces a warning; the

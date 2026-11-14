@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,92 @@ type sockOwnerValue struct {
 	Tgid   uint32
 	UID    uint32
 	BootNs uint64 // CLOCK_BOOTTIME when the owner was recorded
+}
+
+func newSockOwnerKey(network string, ip netip.Addr, srcPort int) (sockOwnerKey, bool) {
+	key := sockOwnerKey{Addr: ip.Unmap().As16(), Port: uint16(srcPort)}
+	switch {
+	case strings.HasPrefix(network, "tcp"):
+		key.Proto = unix.IPPROTO_TCP
+	case strings.HasPrefix(network, "udp"):
+		key.Proto = unix.IPPROTO_UDP
+	default:
+		return sockOwnerKey{}, false
+	}
+	return key, true
+}
+
+// pinnedMapSet tracks one pinned-map publication point: its path, the inode
+// of the pin that is open, and when it was last checked. Both the socket-owner
+// maps and the Wine maps use it to notice a loader restart and to warn about
+// a publication point they can't use.
+type pinnedMapSet struct {
+	path      string
+	ino       uint64
+	checkedAt time.Time
+	warned    string
+}
+
+// reset forgets the open pin and its warnings.
+func (p *pinnedMapSet) reset(path string) {
+	p.path = path
+	p.ino = 0
+	p.checkedAt = time.Time{}
+	p.warned = ""
+}
+
+// stale reports whether the pin should be checked again before trusting a
+// miss.
+func (p *pinnedMapSet) stale() bool {
+	return time.Since(p.checkedAt) >= sockOwnerMissRecheck
+}
+
+// warnOnce reports whether err should be logged. A repeated error stays
+// quiet until a pin opens again or a different error occurs.
+func (p *pinnedMapSet) warnOnce(err error) bool {
+	text := err.Error()
+	if p.warned == text {
+		return false
+	}
+	p.warned = text
+	return true
+}
+
+// refresh checks whether the publication point at path is still the open pin.
+// If it was removed or replaced, close is called and open reopens it. changed
+// reports whether the open maps changed, so that a caller which already
+// missed can retry the lookup only then. A missing publication point is
+// silent; other errors are returned for the caller to warn about.
+func (p *pinnedMapSet) refresh(path string, close func(), open func() error) (changed bool, err error) {
+	p.checkedAt = time.Now()
+	p.path = path
+	if path == "" {
+		hadOpen := p.ino != 0
+		close()
+		p.ino = 0
+		return hadOpen, nil
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(path, &st); err != nil {
+		hadOpen := p.ino != 0
+		close()
+		p.ino = 0
+		if errors.Is(err, unix.ENOENT) {
+			return hadOpen, nil
+		}
+		return hadOpen, err
+	}
+	if p.ino != 0 && p.ino == st.Ino {
+		return false, nil
+	}
+	close()
+	if err := open(); err != nil {
+		p.ino = 0
+		return true, err
+	}
+	p.ino = st.Ino
+	p.warned = ""
+	return true, nil
 }
 
 // The executable maps defined by socketowner ABI v1 (docs/socketowner.md). The
@@ -80,10 +167,8 @@ type sockOwnerMap struct {
 	fd         int
 	tasksFd    int
 	recentFd   int
-	ino        uint64 // of the pinned file, to notice a new pin
 	netns      uint64
-	checkedAt  time.Time
-	warned     bool
+	pinned     pinnedMapSet
 	execWarned bool
 }
 
@@ -100,9 +185,9 @@ func SetSockOwnerMap(path string) {
 	}
 	m.closeLocked()
 	m.path = path
-	m.checkedAt = time.Time{}
-	m.warned = false
+	m.pinned.reset(path)
 	m.execWarned = false
+	wineFlowMaps.reset()
 }
 
 // SockOwnerMap returns the configured map path.
@@ -143,69 +228,67 @@ func (m *sockOwnerMap) closeLocked() {
 // mihomo starts or be restarted.
 func (m *sockOwnerMap) lookup(fn func(fd int, netns uint64) bool) bool {
 	m.mu.RLock()
-	age := time.Since(m.checkedAt)
-	found := age < sockOwnerRecheck && m.fd >= 0 && fn(m.fd, m.netns)
+	age := time.Since(m.pinned.checkedAt)
+	looked := age < sockOwnerRecheck && m.fd >= 0
+	found := looked && fn(m.fd, m.netns)
 	m.mu.RUnlock()
 	if found || age < sockOwnerMissRecheck {
 		return found
 	}
 
 	m.mu.Lock()
-	if time.Since(m.checkedAt) >= sockOwnerMissRecheck {
-		m.refreshLocked()
+	changed := false
+	if m.pinned.stale() {
+		changed = m.refreshLocked()
 	}
 	m.mu.Unlock()
+	if looked && !changed {
+		return false
+	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.fd >= 0 && fn(m.fd, m.netns)
 }
 
-func (m *sockOwnerMap) refreshLocked() {
-	m.checkedAt = time.Now()
-	if m.path == "" {
-		return
-	}
-	var st unix.Stat_t
-	if err := unix.Stat(m.path, &st); err != nil {
-		m.closeLocked()
-		if !errors.Is(err, unix.ENOENT) {
-			m.warnLocked(err)
-		}
-		return
-	}
-	opened := false
-	if m.fd < 0 || st.Ino != m.ino {
-		m.closeLocked()
+func (m *sockOwnerMap) refreshLocked() bool {
+	changed, err := m.pinned.refresh(m.path, m.closeLocked, func() error {
 		fd, netns, err := openSockOwnerMap(m.path)
 		if err != nil {
-			m.warnLocked(err)
-			return
+			return err
 		}
-		m.fd, m.ino, m.netns = fd, st.Ino, netns
-		m.warned = false
+		m.fd, m.netns = fd, netns
+		return nil
+	})
+	if err != nil && m.pinned.warnOnce(err) {
+		log.Warnln("[Process] Can't use socket owners recorded in %s: %v", m.path, err)
+	}
+	if m.fd < 0 {
+		return changed
+	}
+	if changed {
 		m.execWarned = false
-		opened = true
 	} else if m.tasksFd >= 0 {
-		return
+		return changed
 	}
 	// The loader pins the exec-path maps before the socket-owner map, so
 	// they are in place when a new socket-owner map is. They are retried
 	// on their own until they open, so that a failure to open them doesn't
 	// last as long as the socket-owner map does.
 	dir := filepath.Dir(m.path)
-	err := m.openExecMapsLocked(dir)
+	err = m.openExecMapsLocked(dir)
 	switch {
 	case err == nil:
 		log.Infoln("[Process] Using socket owners and executables recorded in %s", dir)
-		return
+		return changed
 	case !errors.Is(err, unix.ENOENT) && !m.execWarned:
 		log.Warnln("[Process] Can't use executables recorded in %s: %v", dir, err)
 		m.execWarned = true
 	}
-	if opened {
+	if changed {
 		log.Infoln("[Process] Using socket owners recorded in %s", m.path)
 	}
+	return changed
 }
 
 func (m *sockOwnerMap) openExecMapsLocked(dir string) error {
@@ -220,13 +303,6 @@ func (m *sockOwnerMap) openExecMapsLocked(dir string) error {
 	}
 	m.tasksFd, m.recentFd = tasksFd, recentFd
 	return nil
-}
-
-func (m *sockOwnerMap) warnLocked(err error) {
-	if !m.warned {
-		log.Warnln("[Process] Can't use socket owners recorded in %s: %v", m.path, err)
-		m.warned = true
-	}
 }
 
 func openSockOwnerMap(path string) (int, uint64, error) {
@@ -244,20 +320,29 @@ func openSockOwnerMap(path string) (int, uint64, error) {
 	return fd, netns, nil
 }
 
-// checkSockOwnerABI rejects absent or incompatible markers before interpreting
-// records. Map type and size checks below additionally protect lookup buffers.
-func checkSockOwnerABI(dir string) error {
-	fd, err := openBPFMap(filepath.Join(dir, "abi_version"), unix.BPF_MAP_TYPE_ARRAY, 4, uint32(0))
+// checkABI rejects an absent or incompatible marker before interpreting
+// records in maps with the given ABI version.
+func checkABI(path string, want uint32) error {
+	fd, err := openBPFMap(path, unix.BPF_MAP_TYPE_ARRAY, 4, uint32(0))
 	if err != nil {
-		return fmt.Errorf("socketowner ABI (install a compatible socketowner loader): %w", err)
+		return err
 	}
 	defer unix.Close(fd)
 	var key, version uint32
 	if !lookupBPFMap(fd, &key, &version) {
-		return fmt.Errorf("socketowner ABI: cannot read version")
+		return fmt.Errorf("cannot read ABI version from %s", path)
 	}
-	if version != sockOwnerABIVersion {
-		return fmt.Errorf("unsupported socketowner ABI v%d (need v%d)", version, sockOwnerABIVersion)
+	if version != want {
+		return fmt.Errorf("unsupported ABI v%d in %s (need v%d)", version, path, want)
+	}
+	return nil
+}
+
+// checkSockOwnerABI rejects absent or incompatible markers before interpreting
+// records. Map type and size checks below additionally protect lookup buffers.
+func checkSockOwnerABI(dir string) error {
+	if err := checkABI(filepath.Join(dir, "abi_version"), sockOwnerABIVersion); err != nil {
+		return fmt.Errorf("socketowner ABI (install a compatible socketowner loader): %w", err)
 	}
 	return nil
 }
@@ -280,6 +365,8 @@ func openBPFMap[V any](path string, mapType, keySize uint32, value V) (int, erro
 		FileFlags: unix.BPF_F_RDONLY,
 	}
 	fd, _, errno := unix.Syscall(unix.SYS_BPF, unix.BPF_OBJ_GET, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	runtime.KeepAlive(pathname)
+	runtime.KeepAlive(&attr)
 	if errno != 0 {
 		return -1, fmt.Errorf("open %s: %w", path, errno)
 	}
@@ -314,6 +401,8 @@ func checkBPFMap(fd int, mapType, keySize, valueSize uint32) error {
 		Info:    uint64(uintptr(unsafe.Pointer(&info))),
 	}
 	_, _, errno := unix.Syscall(unix.SYS_BPF, unix.BPF_OBJ_GET_INFO_BY_FD, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	runtime.KeepAlive(&info)
+	runtime.KeepAlive(&attr)
 	if errno != 0 {
 		return fmt.Errorf("map info: %w", errno)
 	}
@@ -337,6 +426,9 @@ func lookupBPFMap[K, V any](fd int, key *K, value *V) bool {
 		Value: uint64(uintptr(unsafe.Pointer(value))),
 	}
 	_, _, errno := unix.Syscall(unix.SYS_BPF, unix.BPF_MAP_LOOKUP_ELEM, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr))
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(value)
+	runtime.KeepAlive(&attr)
 	return errno == 0
 }
 
@@ -350,6 +442,8 @@ func currentNetnsCookie() (uint64, error) {
 	size := uint32(unsafe.Sizeof(cookie))
 	_, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(fd), unix.SOL_SOCKET, soNetnsCookie,
 		uintptr(unsafe.Pointer(&cookie)), uintptr(unsafe.Pointer(&size)), 0)
+	runtime.KeepAlive(&cookie)
+	runtime.KeepAlive(&size)
 	if errno != 0 {
 		return 0, fmt.Errorf("SO_NETNS_COOKIE: %w", errno)
 	}
@@ -357,13 +451,8 @@ func currentNetnsCookie() (uint64, error) {
 }
 
 func lookupSockOwner(network string, ip netip.Addr, srcPort int) (sockOwnerValue, bool) {
-	key := sockOwnerKey{Addr: ip.Unmap().As16(), Port: uint16(srcPort)}
-	switch {
-	case strings.HasPrefix(network, "tcp"):
-		key.Proto = unix.IPPROTO_TCP
-	case strings.HasPrefix(network, "udp"):
-		key.Proto = unix.IPPROTO_UDP
-	default:
+	key, ok := newSockOwnerKey(network, ip, srcPort)
+	if !ok {
 		return sockOwnerValue{}, false
 	}
 	var value sockOwnerValue
@@ -377,7 +466,42 @@ func lookupSockOwner(network string, ip netip.Addr, srcPort int) (sockOwnerValue
 	return value, true
 }
 
-var errSockOwnerGone = errors.New("socket owner exited")
+var (
+	errSockOwnerGone   = errors.New("socket owner exited")
+	errNotInitialPidNS = errors.New("not in the initial PID namespace")
+)
+
+const procPidInitIno = 0xEFFFFFFC
+
+var (
+	pidNamespaceOnce    sync.Once
+	pidNamespaceInitial bool
+)
+
+// inInitialPidNamespace reports whether the reader shares the host PID
+// namespace, which the socketowner TGIDs name. Once is enough: a process
+// can't move between namespaces.
+func inInitialPidNamespace() bool {
+	pidNamespaceOnce.Do(func() {
+		var st unix.Stat_t
+		if err := unix.Stat("/proc/self/ns/pid", &st); err != nil {
+			log.Warnln("[Process] Can't check the PID namespace: %v", err)
+			return
+		}
+		pidNamespaceInitial = st.Ino == procPidInitIno
+		if !pidNamespaceInitial {
+			log.Warnln("[Process] Not in the initial PID namespace; can't resolve process paths from socket owners")
+		}
+	})
+	return pidNamespaceInitial
+}
+
+// sockOwnerPathFallback reports whether a failed sock-owner lookup may fall
+// back to the usual netlink and /proc search. A reused process ID or a nested
+// PID namespace must not: that search could name a different process.
+func sockOwnerPathFallback(err error) bool {
+	return !errors.Is(err, errSockOwnerGone) && !errors.Is(err, errNotInitialPidNS)
+}
 
 // resolveSockOwnerPath returns the executable of the recorded owner, from the
 // exec-path maps if the loader pinned them and from /proc/<pid>/exe otherwise.
@@ -385,15 +509,32 @@ func resolveSockOwnerPath(owner sockOwnerValue) (string, error) {
 	m := sockOwners
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if !inInitialPidNamespace() {
+		return "", errNotInitialPidNS
+	}
 	if m.tasksFd >= 0 {
-		path, err := m.execPathLocked(owner)
-		if err == nil || m.only {
-			return path, err
-		}
-	} else if m.only {
+		// With exec-path records, a miss is not a reason to read /proc:
+		// that would name a reused process ID in the record's place.
+		return m.execPathLocked(owner)
+	}
+	if m.only {
 		return "", ErrNotFound
 	}
 	return readSockOwnerExe(owner)
+}
+
+// execPath decodes the recorded executable path.
+func (v *execPathValue) execPath() (string, error) {
+	switch {
+	case v.Len < 0:
+		return "", fmt.Errorf("not recorded: %w", unix.Errno(-v.Len))
+	case v.Len <= 1:
+		return "", errors.New("recorded path is empty")
+	}
+	if int(v.Len) > len(v.Path) {
+		return "", fmt.Errorf("recorded path length %d exceeds %d", v.Len, len(v.Path))
+	}
+	return string(v.Path[:v.Len-1]), nil
 }
 
 // execPathLocked looks the owner up in the running processes and then among
@@ -416,10 +557,11 @@ func (m *sockOwnerMap) execPathLocked(owner sockOwnerValue) (string, error) {
 	if !found {
 		return "", errSockOwnerGone
 	}
-	if value.Len <= 0 || int(value.Len) > len(value.Path) {
-		return "", fmt.Errorf("executable of process %d not recorded: %w", owner.Tgid, unix.Errno(-value.Len))
+	path, err := value.execPath()
+	if err != nil {
+		return "", fmt.Errorf("executable of process %d: %w", owner.Tgid, err)
 	}
-	return string(value.Path[:value.Len-1]), nil
+	return path, nil
 }
 
 // readSockOwnerExe reads the executable of the recorded owner from /proc.

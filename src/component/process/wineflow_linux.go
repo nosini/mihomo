@@ -1,6 +1,7 @@
 package process
 
 import (
+	"fmt"
 	"net/netip"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,8 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/metacubex/mihomo/log"
 
 	"golang.org/x/sys/unix"
 )
@@ -55,9 +58,8 @@ type wineFlows struct {
 	mu          sync.RWMutex
 	flowsFd     int
 	heartbeatFd int
-	ino         uint64
 	netns       uint64
-	checkedAt   time.Time
+	pinned      pinnedMapSet
 }
 
 var wineFlowMaps = &wineFlows{flowsFd: -1, heartbeatFd: -1}
@@ -71,45 +73,43 @@ func (w *wineFlows) closeLocked() {
 	}
 }
 
-func (w *wineFlows) refreshLocked(dir string) {
-	w.checkedAt = time.Now()
-	if dir == "." {
-		w.closeLocked()
-		return
-	}
-	var st unix.Stat_t
-	if err := unix.Stat(filepath.Join(dir, wineFlowsMap), &st); err != nil {
-		w.closeLocked()
-		return
-	}
-	if w.flowsFd >= 0 && st.Ino == w.ino {
-		return
-	}
+func (w *wineFlows) reset() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.closeLocked()
-	version, err := openBPFMap(filepath.Join(dir, wineABIMap), unix.BPF_MAP_TYPE_ARRAY, 4, uint32(0))
-	if err != nil {
-		return
-	}
-	defer unix.Close(version)
-	var key, abi uint32
-	if !lookupBPFMap(version, &key, &abi) || abi != wineABIVersion {
-		return
+	w.pinned.reset("")
+}
+
+func (w *wineFlows) openLocked(dir string) error {
+	if err := checkABI(filepath.Join(dir, wineABIMap), wineABIVersion); err != nil {
+		return fmt.Errorf("Wine ABI: %w", err)
 	}
 	netns, err := currentNetnsCookie()
 	if err != nil {
-		return
+		return err
 	}
 	heartbeat, err := openBPFMap(filepath.Join(dir, wineHeartbeatMap), unix.BPF_MAP_TYPE_ARRAY, 4, uint64(0))
 	if err != nil {
-		return
+		return err
 	}
 	flows, err := openBPFMap(filepath.Join(dir, wineFlowsMap), unix.BPF_MAP_TYPE_LRU_HASH,
 		uint32(unsafe.Sizeof(sockOwnerKey{})), wineFlowValue{})
 	if err != nil {
 		unix.Close(heartbeat)
-		return
+		return err
 	}
-	w.flowsFd, w.heartbeatFd, w.ino, w.netns = flows, heartbeat, st.Ino, netns
+	w.flowsFd, w.heartbeatFd, w.netns = flows, heartbeat, netns
+	return nil
+}
+
+func (w *wineFlows) refreshLocked(dir string) bool {
+	changed, err := w.pinned.refresh(filepath.Join(dir, wineFlowsMap), w.closeLocked, func() error {
+		return w.openLocked(dir)
+	})
+	if err != nil && w.pinned.warnOnce(err) {
+		log.Warnln("[Process] Can't use Wine maps in %s: %v", dir, err)
+	}
+	return changed
 }
 
 // lookup returns the record of a flow, given its key without the namespace.
@@ -117,11 +117,11 @@ func (w *wineFlows) refreshLocked(dir string) {
 // unmaintained: a port may have changed hands.
 func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, live, found bool) {
 	w.mu.RLock()
-	stale := time.Since(w.checkedAt) >= sockOwnerMissRecheck
+	stale := w.pinned.stale()
 	w.mu.RUnlock()
 	if stale {
 		w.mu.Lock()
-		if time.Since(w.checkedAt) >= sockOwnerMissRecheck {
+		if w.pinned.stale() {
 			w.refreshLocked(dir)
 		}
 		w.mu.Unlock()
@@ -144,23 +144,31 @@ func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, 
 	return value, live, true
 }
 
+// wineFlowsDir returns the directory of the Wine maps beside the configured
+// socket-owner map. An empty owner path disables them; a relative owner path
+// keeps the Wine maps relative too, so a map in the working directory works.
+func wineFlowsDir(ownerPath string) (string, bool) {
+	if ownerPath == "" {
+		return "", false
+	}
+	return filepath.Dir(ownerPath), true
+}
+
 // findWineProcess names the Windows program behind a flow, which is reported
 // beside the process owning the socket, such as a sandbox's relay. ok is false
 // when no Wine record covers it. An unusable record gives WineUnknown, so that
 // a rule for a Windows program is never passed for lack of its identity.
 func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path string, ok bool) {
-	key := sockOwnerKey{Addr: ip.Unmap().As16(), Port: uint16(srcPort)}
-	switch {
-	case strings.HasPrefix(network, "tcp"):
-		key.Proto = unix.IPPROTO_TCP
-	case strings.HasPrefix(network, "udp"):
-		key.Proto = unix.IPPROTO_UDP
-	default:
+	key, ok := newSockOwnerKey(network, ip, srcPort)
+	if !ok {
 		return "", "", false
 	}
 	sockOwners.mu.RLock()
-	dir := filepath.Dir(sockOwners.path)
-	sockOwners.mu.RUnlock()
+	defer sockOwners.mu.RUnlock()
+	dir, enabled := wineFlowsDir(sockOwners.path)
+	if !enabled {
+		return "", "", false
+	}
 	value, live, found := wineFlowMaps.lookup(&key, dir)
 	if !found {
 		return "", "", false
@@ -175,9 +183,10 @@ func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path str
 }
 
 // wineImage decodes the image as socketowner does: an absolute UTF-16 Windows
-// drive or UNC path, or the filename alone in bytes for clients with no
-// reachable path. socketowner published it only after checking it; a reader of
-// a shared ABI checks again, so that a malformed image is never a usable name.
+// drive or UNC path, or for 32-bit clients only the filename in bytes, with no
+// reachable Windows path. socketowner published it only after checking it; a
+// reader of a shared ABI checks again, so that a malformed image is never a
+// usable name.
 func wineImage(value *wineFlowValue) (name, path string, ok bool) {
 	size := value.ImageBytes
 	if value.Encoding == 1 {
@@ -192,7 +201,7 @@ func wineImage(value *wineFlowValue) (name, path string, ok bool) {
 		if !utf8.ValidString(name) || strings.ContainsAny(name, "\x00/\\") || name == "." || name == ".." {
 			return "", "", false
 		}
-		return name, name, true
+		return name, "", true
 	}
 	if value.Encoding != 0 || size < 2 || size > wineImageBytes || size%2 != 0 {
 		return "", "", false

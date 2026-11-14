@@ -15,7 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -200,8 +202,15 @@ func startChild(t *testing.T, child, mode, addr string, extra *os.File) (*exec.C
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	line, _ := bufio.NewReader(stdout).ReadString('\n')
-	pid, _ := strconv.Atoi(line[:len(line)-1])
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read child PID: %v", err)
+	}
+	line = strings.TrimSuffix(line, "\n")
+	pid, err := strconv.Atoi(line)
+	if err != nil {
+		t.Fatalf("child printed %q instead of a PID: %v", line, err)
+	}
 	return cmd, stdin, pid
 }
 
@@ -369,6 +378,8 @@ func pinObject(fd int, path string) error {
 		Flags    uint32
 	}{Pathname: uint64(uintptr(unsafe.Pointer(p))), BpfFd: uint32(fd)}
 	_, err := bpfCall(unix.BPF_OBJ_PIN, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	runtime.KeepAlive(p)
+	runtime.KeepAlive(&attr)
 	return err
 }
 
@@ -380,6 +391,8 @@ func openPinnedRW(path string) (int, error) {
 		Flags    uint32
 	}{Pathname: uint64(uintptr(unsafe.Pointer(p)))}
 	fd, err := bpfCall(unix.BPF_OBJ_GET, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	runtime.KeepAlive(p)
+	runtime.KeepAlive(&attr)
 	return int(fd), err
 }
 
@@ -392,6 +405,9 @@ func mapElem(cmd uintptr, fd int, key, value unsafe.Pointer) error {
 		Flags uint64
 	}{MapFd: uint32(fd), Key: uint64(uintptr(key)), Value: uint64(uintptr(value))}
 	_, err := bpfCall(cmd, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(value)
+	runtime.KeepAlive(&attr)
 	return err
 }
 
@@ -692,7 +708,7 @@ func TestExecMapsRetried(t *testing.T) {
 	state := func() (connOpen, execOpen bool) {
 		sockOwners.mu.Lock()
 		defer sockOwners.mu.Unlock()
-		sockOwners.checkedAt = time.Time{} // check the pins on the next lookup
+		sockOwners.pinned.checkedAt = time.Time{} // check the pins on the next lookup
 		return sockOwners.fd >= 0, sockOwners.tasksFd >= 0
 	}
 	state()

@@ -1,5 +1,5 @@
 diff --git a/component/process/process.go b/component/process/process.go
-index 464f5a79b..18a8003c7 100644
+index 464f5a7..18a8003 100644
 --- a/component/process/process.go
 +++ b/component/process/process.go
 @@ -18,10 +18,21 @@ const (
@@ -25,16 +25,22 @@ index 464f5a79b..18a8003c7 100644
  // never change type traits because it's used in CMFA
  type PackageNameResolver func(metadata *C.Metadata) (string, error)
 diff --git a/component/process/process_linux.go b/component/process/process_linux.go
-index 2e36f6741..3ac6487b2 100644
+index 2e36f67..ba86b38 100644
 --- a/component/process/process_linux.go
 +++ b/component/process/process_linux.go
-@@ -63,6 +63,15 @@ type inetDiagResponse struct {
+@@ -63,6 +63,21 @@ type inetDiagResponse struct {
  }
  
  func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
 +	if owner, ok := lookupSockOwner(network, ip, srcPort); ok {
-+		if path, err := resolveSockOwnerPath(owner); err == nil {
++		path, err := resolveSockOwnerPath(owner)
++		if err == nil {
 +			return owner.UID, path, nil
++		}
++		// Keep the owner's UID usable when only its path is unavailable,
++		// but never report an empty path as a process match.
++		if SockOwnerOnly() || !sockOwnerPathFallback(err) {
++			return owner.UID, "", err
 +		}
 +	}
 +	if SockOwnerOnly() {
@@ -44,7 +50,7 @@ index 2e36f6741..3ac6487b2 100644
  	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort)
  	if runtime.GOOS == "android" {
  		// on Android (especially recent releases), netlink INET_DIAG can fail or return UID 0 / empty process info for some apps
-@@ -179,7 +188,10 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
+@@ -179,7 +194,10 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
  	if err != nil {
  		return "", err
  	}
@@ -55,7 +61,7 @@ index 2e36f6741..3ac6487b2 100644
  	buffer := make([]byte, unix.PathMax)
  	socket := fmt.Appendf(nil, "socket:[%d]", inode)
  
-@@ -190,6 +202,9 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
+@@ -190,6 +208,9 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
  
  		info, err := f.Info()
  		if err != nil {
@@ -66,18 +72,58 @@ index 2e36f6741..3ac6487b2 100644
  		}
  		if info.Sys().(*syscall.Stat_t).Uid != uid {
 diff --git a/config/config.go b/config/config.go
-index 707114a33..f3441fcf5 100644
+index 707114a..106e90d 100644
 --- a/config/config.go
 +++ b/config/config.go
-@@ -61,6 +61,8 @@ type General struct {
- 	GeositeMatcher    string                  `json:"geosite-matcher"`
- 	TCPConcurrent     bool                    `json:"tcp-concurrent"`
- 	FindProcessMode   process.FindProcessMode `json:"find-process-mode"`
-+	FindProcessBPFMap string                  `json:"find-process-bpf-map"`
-+	FindProcBPFOnly   bool                    `json:"find-process-bpf-only"`
- 	Sniffing          bool                    `json:"sniffing"`
- 	GlobalUA          string                  `json:"global-ua"`
- 	ETagSupport       bool                    `json:"etag-support"`
+@@ -47,26 +47,28 @@ import (
+ // General config
+ type General struct {
+ 	Inbound
+-	Mode              T.TunnelMode            `json:"mode"`
+-	UnifiedDelay      bool                    `json:"unified-delay"`
+-	LogLevel          log.LogLevel            `json:"log-level"`
+-	IPv6              bool                    `json:"ipv6"`
+-	Interface         string                  `json:"interface-name"`
+-	RoutingMark       int                     `json:"routing-mark"`
+-	GeoXUrl           GeoXUrl                 `json:"geox-url"`
+-	GeoAutoUpdate     bool                    `json:"geo-auto-update"`
+-	GeoUpdateInterval int                     `json:"geo-update-interval"`
+-	GeodataMode       bool                    `json:"geodata-mode"`
+-	GeodataLoader     string                  `json:"geodata-loader"`
+-	GeositeMatcher    string                  `json:"geosite-matcher"`
+-	TCPConcurrent     bool                    `json:"tcp-concurrent"`
+-	FindProcessMode   process.FindProcessMode `json:"find-process-mode"`
+-	Sniffing          bool                    `json:"sniffing"`
+-	GlobalUA          string                  `json:"global-ua"`
+-	ETagSupport       bool                    `json:"etag-support"`
+-	KeepAliveIdle     int                     `json:"keep-alive-idle"`
+-	KeepAliveInterval int                     `json:"keep-alive-interval"`
+-	DisableKeepAlive  bool                    `json:"disable-keep-alive"`
++	Mode               T.TunnelMode            `json:"mode"`
++	UnifiedDelay       bool                    `json:"unified-delay"`
++	LogLevel           log.LogLevel            `json:"log-level"`
++	IPv6               bool                    `json:"ipv6"`
++	Interface          string                  `json:"interface-name"`
++	RoutingMark        int                     `json:"routing-mark"`
++	GeoXUrl            GeoXUrl                 `json:"geox-url"`
++	GeoAutoUpdate      bool                    `json:"geo-auto-update"`
++	GeoUpdateInterval  int                     `json:"geo-update-interval"`
++	GeodataMode        bool                    `json:"geodata-mode"`
++	GeodataLoader      string                  `json:"geodata-loader"`
++	GeositeMatcher     string                  `json:"geosite-matcher"`
++	TCPConcurrent      bool                    `json:"tcp-concurrent"`
++	FindProcessMode    process.FindProcessMode `json:"find-process-mode"`
++	FindProcessBPFMap  string                  `json:"find-process-bpf-map"`
++	FindProcessBPFOnly bool                    `json:"find-process-bpf-only"`
++	Sniffing           bool                    `json:"sniffing"`
++	GlobalUA           string                  `json:"global-ua"`
++	ETagSupport        bool                    `json:"etag-support"`
++	KeepAliveIdle      int                     `json:"keep-alive-idle"`
++	KeepAliveInterval  int                     `json:"keep-alive-interval"`
++	DisableKeepAlive   bool                    `json:"disable-keep-alive"`
+ }
+ 
+ // Inbound config
 @@ -441,6 +443,8 @@ type RawConfig struct {
  	GeositeMatcher                string                  `yaml:"geosite-matcher" json:"geosite-matcher"`
  	TCPConcurrent                 bool                    `yaml:"tcp-concurrent" json:"tcp-concurrent"`
@@ -95,17 +141,41 @@ index 707114a33..f3441fcf5 100644
  		GlobalUA:          "clash.meta/" + C.Version,
  		ETagSupport:       true,
  		DNS: RawDNS{
-@@ -797,6 +802,8 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
- 		GeositeMatcher:    cfg.GeositeMatcher,
- 		TCPConcurrent:     cfg.TCPConcurrent,
- 		FindProcessMode:   cfg.FindProcessMode,
-+		FindProcessBPFMap: cfg.FindProcessBPFMap,
-+		FindProcBPFOnly:   cfg.FindProcessBPFOnly,
- 		GlobalUA:          cfg.GlobalUA,
- 		ETagSupport:       cfg.ETagSupport,
- 		KeepAliveIdle:     cfg.KeepAliveIdle,
+@@ -790,18 +795,20 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
+ 			ASN:     cfg.GeoXUrl.ASN,
+ 			GeoSite: cfg.GeoXUrl.GeoSite,
+ 		},
+-		GeoAutoUpdate:     cfg.GeoAutoUpdate,
+-		GeoUpdateInterval: cfg.GeoUpdateInterval,
+-		GeodataMode:       cfg.GeodataMode,
+-		GeodataLoader:     cfg.GeodataLoader,
+-		GeositeMatcher:    cfg.GeositeMatcher,
+-		TCPConcurrent:     cfg.TCPConcurrent,
+-		FindProcessMode:   cfg.FindProcessMode,
+-		GlobalUA:          cfg.GlobalUA,
+-		ETagSupport:       cfg.ETagSupport,
+-		KeepAliveIdle:     cfg.KeepAliveIdle,
+-		KeepAliveInterval: cfg.KeepAliveInterval,
+-		DisableKeepAlive:  cfg.DisableKeepAlive,
++		GeoAutoUpdate:      cfg.GeoAutoUpdate,
++		GeoUpdateInterval:  cfg.GeoUpdateInterval,
++		GeodataMode:        cfg.GeodataMode,
++		GeodataLoader:      cfg.GeodataLoader,
++		GeositeMatcher:     cfg.GeositeMatcher,
++		TCPConcurrent:      cfg.TCPConcurrent,
++		FindProcessMode:    cfg.FindProcessMode,
++		FindProcessBPFMap:  cfg.FindProcessBPFMap,
++		FindProcessBPFOnly: cfg.FindProcessBPFOnly,
++		GlobalUA:           cfg.GlobalUA,
++		ETagSupport:        cfg.ETagSupport,
++		KeepAliveIdle:      cfg.KeepAliveIdle,
++		KeepAliveInterval:  cfg.KeepAliveInterval,
++		DisableKeepAlive:   cfg.DisableKeepAlive,
+ 	}, nil
+ }
+ 
 diff --git a/constant/metadata.go b/constant/metadata.go
-index 76d1e0e5c..cc7a531b4 100644
+index 76d1e0e..cc7a531 100644
 --- a/constant/metadata.go
 +++ b/constant/metadata.go
 @@ -217,6 +217,10 @@ type Metadata struct {
@@ -137,7 +207,7 @@ index 76d1e0e5c..cc7a531b4 100644
  	case m.Process != "" && m.Uid != 0:
  		return fmt.Sprintf("%s(%s, uid=%d)", m.SourceAddress(), m.Process, m.Uid)
 diff --git a/constant/rule.go b/constant/rule.go
-index 05ea8ebd3..f7e6d414c 100644
+index 05ea8eb..f7e6d41 100644
 --- a/constant/rule.go
 +++ b/constant/rule.go
 @@ -40,6 +40,12 @@ const (
@@ -173,7 +243,7 @@ index 05ea8ebd3..f7e6d414c 100644
  		return "Unknown"
  	}
 diff --git a/docs/config.yaml b/docs/config.yaml
-index 7e51bb882..9f40f7599 100644
+index 7e51bb8..9f40f75 100644
 --- a/docs/config.yaml
 +++ b/docs/config.yaml
 @@ -25,6 +25,21 @@ lan-disallowed-ips: # 禁止连接的 IP 地址段，黑名单优先级高于白
@@ -213,7 +283,7 @@ index 7e51bb882..9f40f7599 100644
    - SUB-RULE,(OR,((NETWORK,TCP),(NETWORK,UDP))),sub-rule-name1
    - SUB-RULE,(AND,((NETWORK,UDP))),sub-rule-name2
 diff --git a/hub/executor/executor.go b/hub/executor/executor.go
-index 796face2f..410bcd43b 100644
+index 796face..49044fe 100644
 --- a/hub/executor/executor.go
 +++ b/hub/executor/executor.go
 @@ -21,6 +21,7 @@ import (
@@ -224,26 +294,102 @@ index 796face2f..410bcd43b 100644
  	"github.com/metacubex/mihomo/component/profile"
  	"github.com/metacubex/mihomo/component/profile/cachefile"
  	"github.com/metacubex/mihomo/component/resolver"
-@@ -172,6 +173,8 @@ func GetGeneral() *config.General {
- 		GeositeMatcher:    geodata.SiteMatcherName(),
- 		TCPConcurrent:     dialer.GetTcpConcurrent(),
- 		FindProcessMode:   tunnel.FindProcessMode(),
-+		FindProcessBPFMap: process.SockOwnerMap(),
-+		FindProcBPFOnly:   process.SockOwnerOnly(),
- 		Sniffing:          tunnel.IsSniffing(),
- 		GlobalUA:          mihomoHttp.UA(),
- 		ETagSupport:       resource.ETag(),
+@@ -165,19 +166,21 @@ func GetGeneral() *config.General {
+ 			ASN:     geodata.ASNUrl(),
+ 			GeoSite: geodata.GeoSiteUrl(),
+ 		},
+-		GeoAutoUpdate:     updater.GeoAutoUpdate(),
+-		GeoUpdateInterval: updater.GeoUpdateInterval(),
+-		GeodataMode:       geodata.GeodataMode(),
+-		GeodataLoader:     geodata.LoaderName(),
+-		GeositeMatcher:    geodata.SiteMatcherName(),
+-		TCPConcurrent:     dialer.GetTcpConcurrent(),
+-		FindProcessMode:   tunnel.FindProcessMode(),
+-		Sniffing:          tunnel.IsSniffing(),
+-		GlobalUA:          mihomoHttp.UA(),
+-		ETagSupport:       resource.ETag(),
+-		KeepAliveInterval: int(keepalive.KeepAliveInterval() / time.Second),
+-		KeepAliveIdle:     int(keepalive.KeepAliveIdle() / time.Second),
+-		DisableKeepAlive:  keepalive.DisableKeepAlive(),
++		GeoAutoUpdate:      updater.GeoAutoUpdate(),
++		GeoUpdateInterval:  updater.GeoUpdateInterval(),
++		GeodataMode:        geodata.GeodataMode(),
++		GeodataLoader:      geodata.LoaderName(),
++		GeositeMatcher:     geodata.SiteMatcherName(),
++		TCPConcurrent:      dialer.GetTcpConcurrent(),
++		FindProcessMode:    tunnel.FindProcessMode(),
++		FindProcessBPFMap:  process.SockOwnerMap(),
++		FindProcessBPFOnly: process.SockOwnerOnly(),
++		Sniffing:           tunnel.IsSniffing(),
++		GlobalUA:           mihomoHttp.UA(),
++		ETagSupport:        resource.ETag(),
++		KeepAliveInterval:  int(keepalive.KeepAliveInterval() / time.Second),
++		KeepAliveIdle:      int(keepalive.KeepAliveIdle() / time.Second),
++		DisableKeepAlive:   keepalive.DisableKeepAlive(),
+ 	}
+ 
+ 	return general
 @@ -393,6 +396,8 @@ func temporaryUpdateGeneral(general *config.General) func() {
  func updateGeneral(general *config.General, logging bool) {
  	tunnel.SetMode(general.Mode)
  	tunnel.SetFindProcessMode(general.FindProcessMode)
 +	process.SetSockOwnerMap(general.FindProcessBPFMap)
-+	process.SetSockOwnerOnly(general.FindProcBPFOnly)
++	process.SetSockOwnerOnly(general.FindProcessBPFOnly)
  	resolver.DisableIPv6 = !general.IPv6
  
  	dialer.SetTcpConcurrent(general.TCPConcurrent)
+diff --git a/hub/route/upgrade.go b/hub/route/upgrade.go
+index b359366..3c38e7c 100644
+--- a/hub/route/upgrade.go
++++ b/hub/route/upgrade.go
+@@ -2,7 +2,6 @@ package route
+ 
+ import (
+ 	"fmt"
+-	"os"
+ 
+ 	"github.com/metacubex/mihomo/component/updater"
+ 	"github.com/metacubex/mihomo/log"
+@@ -23,33 +22,10 @@ func upgradeRouter() http.Handler {
+ }
+ 
+ func upgradeCore(w http.ResponseWriter, r *http.Request) {
+-	// modify from https://github.com/AdguardTeam/AdGuardHome/blob/595484e0b3fb4c457f9bb727a6b94faa78a66c5f/internal/home/controlupdate.go#L108
+-	log.Infoln("start update")
+-	execPath, err := os.Executable()
+-	if err != nil {
+-		render.Status(r, http.StatusInternalServerError)
+-		render.JSON(w, r, newError(fmt.Sprintf("getting path: %s", err)))
+-		return
+-	}
+-
+-	query := r.URL.Query()
+-	channel := query.Get("channel")
+-	force := query.Get("force") == "true"
+-
+-	err = updater.DefaultCoreUpdater.Update(execPath, channel, force)
+-	if err != nil {
+-		log.Warnln("%s", err)
+-		render.Status(r, http.StatusInternalServerError)
+-		render.JSON(w, r, newError(fmt.Sprintf("%s", err)))
+-		return
+-	}
+-
+-	render.JSON(w, r, render.M{"status": "ok"})
+-	if f, ok := w.(http.Flusher); ok {
+-		f.Flush()
+-	}
+-
+-	go restartExecutable(execPath)
++	// This build is not stock MetaCubeX; replacing it would drop the
++	// process-attribution changes. Geo database updates remain available.
++	render.Status(r, http.StatusNotImplemented)
++	render.JSON(w, r, newError("core self-update is disabled in this build"))
+ }
+ 
+ func updateUI(w http.ResponseWriter, r *http.Request) {
 diff --git a/rules/common/base.go b/rules/common/base.go
-index 33ab5a1f3..e4cb6adff 100644
+index 33ab5a1..e4cb6ad 100644
 --- a/rules/common/base.go
 +++ b/rules/common/base.go
 @@ -52,7 +52,8 @@ func ParseRulePayload(ruleRaw string, needTarget bool) (tp, payload, target stri
@@ -257,7 +403,7 @@ index 33ab5a1f3..e4cb6adff 100644
  			if needTarget {
  				l := len(item)
 diff --git a/rules/common/process.go b/rules/common/process.go
-index 77c7b0e3b..823302520 100644
+index 77c7b0e..8233025 100644
 --- a/rules/common/process.go
 +++ b/rules/common/process.go
 @@ -37,15 +37,19 @@ func (ps *Process) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool,
@@ -292,7 +438,7 @@ index 77c7b0e3b..823302520 100644
  		if err != nil {
  			return nil, err
 diff --git a/rules/parser.go b/rules/parser.go
-index 474d01ef4..b35a2647c 100644
+index 474d01e..b35a264 100644
 --- a/rules/parser.go
 +++ b/rules/parser.go
 @@ -67,6 +67,18 @@ func ParseRule(tp, payload, target string, params []string, subRules map[string]
@@ -315,10 +461,22 @@ index 474d01ef4..b35a2647c 100644
  		parsed, parseErr = RC.NewNetworkType(payload, target)
  	case "UID":
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 86dbc14ae..ebbe79f41 100644
+index 86dbc14..ece5beb 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
-@@ -365,6 +365,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+@@ -356,6 +356,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+ 					if err != nil {
+ 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
++						if uid != 0 {
++							// The owner's UID is known even when its
++							// executable path isn't.
++							metadata.Uid = uid
++						}
+ 					} else {
+ 						metadata.Process = filepath.Base(path)
+ 						metadata.ProcessPath = path
+@@ -365,6 +370,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
  							metadata.Process = pkg
  						}
  					}

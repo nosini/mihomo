@@ -30,6 +30,9 @@ build targets are available through this repository's Makefile as well.
 For an existing checkout, initialize the pinned source with
 `git submodule update --init --recursive` before building.
 
+This build disables the hub's core self-update (`POST /upgrade`), which would
+replace it with a stock MetaCubeX binary. Geo database updates are unchanged.
+
 Install the privileged [socketowner](https://github.com/nosini/socketowner)
 loader separately. For Wine names, also install its Wine observer and run it
 before launching games.
