@@ -98,3 +98,16 @@ func TestSockOwnerPathFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestIsInitialPidNamespace(t *testing.T) {
+	for link, want := range map[string]bool{
+		"pid:[4026531836]": true,
+		"pid:[4026532001]": false,
+		"pid:[4026531836":  false,
+		"":                 false,
+	} {
+		if got := isInitialPidNamespace(link); got != want {
+			t.Errorf("%q: got %v, want %v", link, got, want)
+		}
+	}
+}

@@ -483,17 +483,25 @@ var (
 // can't move between namespaces.
 func inInitialPidNamespace() bool {
 	pidNamespaceOnce.Do(func() {
-		var st unix.Stat_t
-		if err := unix.Stat("/proc/self/ns/pid", &st); err != nil {
+		// The link names the namespace inode, so no access to nsfs itself is
+		// needed, which SELinux policies don't usually grant.
+		link, err := os.Readlink("/proc/self/ns/pid")
+		if err != nil {
 			log.Warnln("[Process] Can't check the PID namespace: %v", err)
 			return
 		}
-		pidNamespaceInitial = st.Ino == procPidInitIno
+		pidNamespaceInitial = isInitialPidNamespace(link)
 		if !pidNamespaceInitial {
 			log.Warnln("[Process] Not in the initial PID namespace; can't resolve process paths from socket owners")
 		}
 	})
 	return pidNamespaceInitial
+}
+
+// isInitialPidNamespace reports whether a /proc/<pid>/ns/pid link names the
+// initial PID namespace.
+func isInitialPidNamespace(link string) bool {
+	return link == "pid:["+strconv.FormatUint(procPidInitIno, 10)+"]"
 }
 
 // sockOwnerPathFallback reports whether a failed sock-owner lookup may fall
