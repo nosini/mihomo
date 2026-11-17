@@ -2,9 +2,8 @@
 
 The root repository owns the process-attribution additions, their documentation,
 integration patches and build commands. `upstream/mihomo` is the unmodified
-MetaCubeX repository, pinned to `94b13aed49b8dc41973e4bb3f721c5fa2c5c5c1f`.
-The initial pin preserves the upstream revision used by the tested Wine build;
-this layout change does not upgrade upstream or add other experimental features.
+MetaCubeX repository, pinned to upstream Alpha commit
+`3c0d10a503f7b2fde3fe167d4d91dd05725d5268`.
 
 ## Source layout
 
@@ -92,7 +91,5 @@ Review changes to upstream dependencies and build behavior as part of the
 update. Record the selected revision in this document with the submodule pin.
 Never commit local modifications inside the upstream submodule.
 
-The original `connection-statistics` and `ebpf-hostname-discovery` branches are
-preserved with their existing history and layout. Their features are not applied
-by the `main` assembly. Existing attribution branches are also retained, so the
-pre-migration source and validation history remain accessible.
+Connection statistics and TLS hostname discovery are maintained on their
+respective feature branches. Process and Wine attribution are part of `main`.
