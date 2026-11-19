@@ -34,7 +34,8 @@ socket, such as a sandbox's pasta, and adds the Windows program in separate
 `wineProcess` and `wineProcessPath` fields; one they can't identify reports
 `wine-unknown` there. `WINE-PROCESS-NAME`, `WINE-PROCESS-PATH` and their
 `-REGEX` and `-WILDCARD` forms match these fields as the `PROCESS-*` rules match
-the process, ignoring case:
+the process, ignoring case. A flow without a Wine record matches none of them,
+not even `*` or `.*`:
 
 ```yaml
 rules:

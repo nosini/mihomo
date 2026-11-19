@@ -403,10 +403,10 @@ index 33ab5a1..e4cb6ad 100644
  			if needTarget {
  				l := len(item)
 diff --git a/rules/common/process.go b/rules/common/process.go
-index 77c7b0e..8233025 100644
+index 77c7b0e..8211c8c 100644
 --- a/rules/common/process.go
 +++ b/rules/common/process.go
-@@ -37,15 +37,19 @@ func (ps *Process) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool,
+@@ -37,21 +37,40 @@ func (ps *Process) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool,
  	switch ps.ruleType {
  	case C.ProcessName, C.ProcessNameRegex, C.ProcessNameWildcard:
  		target = metadata.Process
@@ -417,6 +417,12 @@ index 77c7b0e..8233025 100644
  	default:
  		target = metadata.ProcessPath
  	}
++	// Flows without a Wine record, including all native traffic, have empty
++	// Wine fields, which must not match patterns such as * or .*. A record
++	// whose program is unknown still matches as wine-unknown.
++	if target == "" && isWineProcessRule(ps.ruleType) {
++		return false, ps.adapter
++	}
  
  	switch ps.ruleType {
 -	case C.ProcessNameRegex, C.ProcessPathRegex:
@@ -428,7 +434,22 @@ index 77c7b0e..8233025 100644
  		return wildcard.Match(strings.ToLower(ps.pattern), strings.ToLower(target)), ps.adapter
  	default:
  		return strings.EqualFold(target, ps.pattern), ps.adapter
-@@ -60,7 +64,7 @@ func NewProcess(pattern string, adapter string, ruleType C.RuleType) (*Process,
+ 	}
+ }
+ 
++func isWineProcessRule(tp C.RuleType) bool {
++	switch tp {
++	case C.WineProcessName, C.WineProcessNameRegex, C.WineProcessNameWildcard,
++		C.WineProcessPath, C.WineProcessPathRegex, C.WineProcessPathWildcard:
++		return true
++	}
++	return false
++}
++
+ func NewProcess(pattern string, adapter string, ruleType C.RuleType) (*Process, error) {
+ 	ps := &Process{
+ 		Base:     Base{},
+@@ -60,7 +79,7 @@ func NewProcess(pattern string, adapter string, ruleType C.RuleType) (*Process,
  		ruleType: ruleType,
  	}
  	switch ps.ruleType {

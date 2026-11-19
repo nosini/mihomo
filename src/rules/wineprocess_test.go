@@ -34,6 +34,12 @@ func TestWineProcessRules(t *testing.T) {
 		{"WINE-PROCESS-PATH", `c:\games\game\game.exe`, []bool{true, false, false}},
 		{"WINE-PROCESS-PATH-REGEX", `^C:\\Games\\`, []bool{true, false, false}},
 		{"WINE-PROCESS-PATH-WILDCARD", `C:\Games\*`, []bool{true, false, false}},
+		// Native flows have no Wine record and match no Wine rule, not even
+		// a pattern that accepts every name; wine-unknown still does.
+		{"WINE-PROCESS-NAME-WILDCARD", "*", []bool{true, true, false}},
+		{"WINE-PROCESS-NAME-REGEX", ".*", []bool{true, true, false}},
+		{"WINE-PROCESS-PATH-WILDCARD", "*", []bool{true, true, false}},
+		{"WINE-PROCESS-PATH-REGEX", "^$", []bool{false, false, false}},
 		{"PROCESS-NAME", "game.exe", []bool{false, false, true}},
 		{"PROCESS-NAME-REGEX", `^game-pasta(\.avx2)?$`, []bool{true, true, false}},
 	} {
