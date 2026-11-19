@@ -86,14 +86,15 @@ def upstream_fingerprint(source, pin):
                 'Run git submodule update, or stage a new pin with git add upstream/mihomo.')
         run(['git', 'diff', '--exit-code', 'HEAD', '--'], source)
         return b'pin\0' + (pin or '').encode() + b'\0head\0' + head.encode()
+    # Archives may normalize timestamps, so a change that keeps a file's size
+    # shows only in its content.
     digest = hashlib.sha256()
     for relative, stat in upstream_entries(source):
         digest.update(relative.as_posix().encode())
         digest.update(b'\0')
-        digest.update(str(stat.st_mtime_ns).encode())
+        digest.update(oct(stat.st_mode).encode())
         digest.update(b'\0')
-        digest.update(str(stat.st_size).encode())
-        digest.update(b'\n')
+        add_content(digest, source / relative)
     return b'files\0' + digest.digest()
 
 

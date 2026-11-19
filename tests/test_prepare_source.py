@@ -1,6 +1,7 @@
 """Assembly protects the upstream pin and replaces generated files safely."""
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import tempfile
@@ -150,6 +151,28 @@ class AssemblyTests(unittest.TestCase):
         shutil.rmtree(self.upstream / '.git')
         assembler.prepare(self.root)
         self.assertEqual(self.snapshot(output), expected)
+
+    def test_archive_content_change_with_same_size_and_mtime_reassembles(self):
+        shutil.rmtree(self.upstream / '.git')
+        output = assembler.prepare(self.root)
+        docs = self.upstream / 'docs/upstream.md'
+        stat = docs.stat()
+        docs.write_text('UPSTREAM\n')
+        os.utime(docs, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        assembler.prepare(self.root)
+        self.assertEqual((output / 'docs/upstream.md').read_text(), 'UPSTREAM\n')
+
+    def test_archive_symlink_target_change_reassembles(self):
+        shutil.rmtree(self.upstream / '.git')
+        link = self.upstream / 'docs/link.md'
+        link.symlink_to('aaaa.md')
+        output = assembler.prepare(self.root)
+        stat = link.lstat()
+        link.unlink()
+        link.symlink_to('bbbb.md')
+        os.utime(link, ns=(stat.st_atime_ns, stat.st_mtime_ns), follow_symlinks=False)
+        assembler.prepare(self.root)
+        self.assertEqual(os.readlink(output / 'docs/link.md'), 'bbbb.md')
 
 
 if __name__ == '__main__':
