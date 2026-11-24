@@ -55,6 +55,25 @@ unknown-flow and DNS behavior in the
 [Wine observer documentation](https://github.com/nosini/socketowner/tree/main/wine)
 before adding a blanket `wine-unknown` rejection.
 
+## Nameservers for direct outbounds
+
+This branch also lets a `type: direct` outbound send its own DNS queries through
+itself. With `nameserver` set, lookups for its connections use those servers and
+leave with the outbound's `interface-name` and `routing-mark`, so a DNS server
+that chooses its upstream by client address sees the same source as the
+traffic. Each outbound keeps its own cache.
+
+```yaml
+proxies:
+  - name: exit-a
+    type: direct
+    interface-name: eth0.110
+    nameserver: [udp://10.0.0.53]
+```
+
+See [nameservers for direct outbounds](docs/direct-nameserver.md) for the
+accepted entries and the exact behavior.
+
 ## Development and license
 
 Upstream is an unmodified, pinned Git submodule under `upstream/mihomo`.

@@ -1,0 +1,86 @@
+diff --git a/adapter/outbound/direct.go b/adapter/outbound/direct.go
+index 1e2b2ef..5ea41c2 100644
+--- a/adapter/outbound/direct.go
++++ b/adapter/outbound/direct.go
+@@ -13,11 +13,20 @@ import (
+ type Direct struct {
+ 	*Base
+ 	loopBack *loopback.Detector
++	resolver resolver.Resolver // own nameservers, queried through this outbound
+ }
+ 
+ type DirectOption struct {
+ 	BasicOption
+-	Name string `proxy:"name"`
++	Name       string   `proxy:"name"`
++	Nameserver []string `proxy:"nameserver,omitempty"`
++}
++
++func (d *Direct) hostResolver() resolver.Resolver {
++	if d.resolver != nil {
++		return d.resolver
++	}
++	return resolver.DirectHostResolver
+ }
+ 
+ // DialContext implements C.ProxyAdapter
+@@ -26,7 +35,7 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
+ 		return nil, err
+ 	}
+ 	opts := d.DialOptions()
+-	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver))
++	opts = append(opts, dialer.WithResolver(d.hostResolver()))
+ 	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
+ 	if err != nil {
+ 		return nil, err
+@@ -50,8 +59,9 @@ func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
+ }
+ 
+ func (d *Direct) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+-	if (!metadata.Resolved() || resolver.DirectHostResolver != resolver.DefaultResolver) && metadata.Host != "" {
+-		ip, err := resolveIPWithResolver(ctx, metadata.Host, d.prefer, resolver.DirectHostResolver)
++	r := d.hostResolver()
++	if (!metadata.Resolved() || r != resolver.DefaultResolver) && metadata.Host != "" {
++		ip, err := resolveIPWithResolver(ctx, metadata.Host, d.prefer, r)
+ 		if err != nil {
+ 			return fmt.Errorf("can't resolve ip: %w", err)
+ 		}
+@@ -64,8 +74,8 @@ func (d *Direct) IsL3Protocol(metadata *C.Metadata) bool {
+ 	return true // tell DNSDialer don't send domain to DialContext, avoid lookback to DefaultResolver
+ }
+ 
+-func NewDirectWithOption(option DirectOption) *Direct {
+-	return &Direct{
++func NewDirectWithOption(option DirectOption) (*Direct, error) {
++	d := &Direct{
+ 		Base: NewBase(BaseOption{
+ 			Name:         option.Name,
+ 			Type:         C.Direct,
+@@ -79,6 +89,14 @@ func NewDirectWithOption(option DirectOption) *Direct {
+ 		}),
+ 		loopBack: loopback.NewDetector(),
+ 	}
++	if len(option.Nameserver) > 0 {
++		r, err := newDirectResolver(option.Nameserver, d)
++		if err != nil {
++			return nil, fmt.Errorf("direct %s: %w", option.Name, err)
++		}
++		d.resolver = r
++	}
++	return d, nil
+ }
+ 
+ func NewDirect() *Direct {
+diff --git a/adapter/parser.go b/adapter/parser.go
+index 68bccdb..029fef9 100644
+--- a/adapter/parser.go
++++ b/adapter/parser.go
+@@ -131,7 +131,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
+ 		if err != nil {
+ 			break
+ 		}
+-		proxy = outbound.NewDirectWithOption(*directOption)
++		proxy, err = outbound.NewDirectWithOption(*directOption)
+ 	case "dns":
+ 		dnsOptions := &outbound.DnsOption{BasicOption: basicOption}
+ 		err = decoder.Decode(mapping, dnsOptions)
