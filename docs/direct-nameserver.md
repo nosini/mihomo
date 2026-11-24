@@ -60,8 +60,99 @@ families are looked up. `dns.ipv6` does not apply to these servers.
   rules, still use the `dns` section.
 - `DIRECT` and direct outbounds without the option behave as before, and
   `direct-nameserver` keeps its meaning for them.
+- When every nameserver of an outbound fails, the connection fails. The
+  lookup is never answered by `dns.direct-nameserver`, the main
+  `dns.nameserver` list or the system resolver instead.
 - Reloading the configuration discards the cache. Flushing the DNS cache
   through the API does not clear it.
+
+## Connection metadata
+
+A connection whose destination a direct outbound resolved through its own
+nameservers carries an `outboundDns` group in the metadata reported by
+`GET /connections`, the connections websocket and the dashboard's connection
+list. Connections resolved another way, by the `dns` section, a hosts entry
+or a direct outbound without the option, carry nothing.
+
+- `server` is the nameserver that answered, in `dns.nameserver` form with the
+  port mihomo uses, so an entry written as `udp://10.0.0.53` is reported as
+  `udp://10.0.0.53:53`.
+- `localAddr` is the source address of the query as its transport reports it.
+  UDP and TCP queries report the address of the socket that sent the query,
+  which for UDP can be the wildcard address with the source port the
+  nameserver sees. `tls`, `https` and `quic` queries report no local address.
+- `interface` is the outbound's `interface-name` the query was bound to. It
+  is left out when the outbound has none, and for nameservers on loopback
+  addresses, which mihomo does not bind (see Limitations).
+- `cached` is true when the answer came from the outbound's cache. The other
+  values are then those of the query that filled the entry, and no query
+  leaves mihomo.
+
+```json
+{
+  "id": "0f4c1b6e-4f88-4d21-9b0e-5f1a2b3c4d5e",
+  "metadata": {
+    "network": "tcp",
+    "type": "Socks5",
+    "sourceIP": "192.168.1.23",
+    "destinationIP": "203.0.113.10",
+    "sourcePort": "51423",
+    "destinationPort": "443",
+    "host": "example.org",
+    "process": "curl",
+    "outboundDns": {
+      "server": "udp://10.0.0.53:53",
+      "localAddr": "10.0.0.5:53712",
+      "interface": "eth0.110",
+      "cached": true
+    }
+  },
+  "start": "2026-11-24T18:30:00Z",
+  "chains": ["exit-a"],
+  "rule": "Match",
+  "rulePayload": ""
+}
+```
+
+With several nameservers configured, the group names the one that first
+answered the lookup. A dual-stack lookup sends an A and an AAAA query; the
+group reports the first of them that was answered.
+
+Every query that leaves through the outbound is logged at debug level, one
+line per query, with the outbound name, the host, the nameserver, the local
+address and the answer's rcode or the error:
+
+```text
+[DNS] exit-a: example.org queried via udp://10.0.0.53:53 (local 10.0.0.5:53712): NOERROR
+[DNS] exit-a: example.org queried via udp://10.0.0.53:53 (local 10.0.0.5:53712): read: connection refused
+```
+
+Cache hits are not queries and log nothing.
+
+## Verifying
+
+To confirm that a connection's DNS left through its exit, open the
+connection list while a connection through the exit is up and read the
+connection's `outboundDns` group:
+
+- `server` names one of the exit's own nameservers, never a server from the
+  `dns` section.
+- `interface` names the exit's `interface-name`.
+- `cached` tells whether the answer needed a query; when it is true, the
+  remaining values describe the earlier query that filled the cache entry.
+
+The DNS server's own query log completes the picture: the query for the
+connection's host must arrive there, from the source address in `localAddr`
+over the exit's interface. The `dns` section's servers must show no query
+for the host. Running mihomo with `log-level: debug` adds one line per query
+that left through the exit, as shown above, which is enough to follow
+resolution without any external service.
+
+A connection through a second exit with its own nameserver shows that exit's
+server in its `outboundDns` group, and each server's log shows only the
+queries of the exit configured with it. When every nameserver of an exit
+fails, its connections fail outright: the dial reports the DNS error, and no
+other resolver answers in their place.
 
 ## Limitations
 

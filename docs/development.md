@@ -95,4 +95,6 @@ Connection statistics and TLS hostname discovery are maintained on their
 respective feature branches. Process and Wine attribution and nameservers for
 direct outbounds are part of `main`; the latter is
 `patches/0002-direct-outbound-nameserver.patch` with
-`src/adapter/outbound/direct_nameserver*.go`.
+`src/adapter/outbound/direct_nameserver*.go`, and the verifiable DNS
+metadata those outbounds record is
+`patches/0004-direct-nameserver-metadata.patch` with `src/dns/query_trace*.go`.

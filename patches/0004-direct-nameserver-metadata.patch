@@ -1,0 +1,271 @@
+diff --git a/adapter/outbound/direct.go b/adapter/outbound/direct.go
+index 5ea41c2..bbace37 100644
+--- a/adapter/outbound/direct.go
++++ b/adapter/outbound/direct.go
+@@ -36,10 +36,14 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
+ 	}
+ 	opts := d.DialOptions()
+ 	opts = append(opts, dialer.WithResolver(d.hostResolver()))
++	ctx, trace := d.withLookupTrace(ctx, metadata)
+ 	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	// The tracker exposing this metadata is created only after this dial
++	// returns, so writing to it here cannot race with its readers.
++	d.recordLookup(trace, metadata)
+ 	return d.loopBack.NewConn(NewConn(c, d)), nil
+ }
+ 
+@@ -61,11 +65,15 @@ func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
+ func (d *Direct) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+ 	r := d.hostResolver()
+ 	if (!metadata.Resolved() || r != resolver.DefaultResolver) && metadata.Host != "" {
++		// The metadata is written before the tracker exposing it is created,
++		// like the destination address below.
++		ctx, trace := d.withLookupTrace(ctx, metadata)
+ 		ip, err := resolveIPWithResolver(ctx, metadata.Host, d.prefer, r)
+ 		if err != nil {
+ 			return fmt.Errorf("can't resolve ip: %w", err)
+ 		}
+ 		metadata.DstIP = ip
++		d.recordLookup(trace, metadata)
+ 	}
+ 	return nil
+ }
+diff --git a/constant/metadata.go b/constant/metadata.go
+index cc7a531..aa997cb 100644
+--- a/constant/metadata.go
++++ b/constant/metadata.go
+@@ -221,6 +221,21 @@ type Metadata struct {
+ 	// The Windows program behind a Wine connection, beside the process owning its socket
+ 	WineProcess     string `json:"wineProcess,omitempty"`
+ 	WineProcessPath string `json:"wineProcessPath,omitempty"`
++
++	// How a direct outbound with its own nameserver list resolved the
++	// destination of this connection, when it did
++	OutboundDNS *OutboundDNS `json:"outboundDns,omitempty"`
++}
++
++// OutboundDNS is set on a connection whose destination was resolved through
++// the direct outbound's own nameservers. The outbound fills it while
++// dialing, before the tracker that exposes the metadata is created, so
++// readers of the connection list cannot race with the write.
++type OutboundDNS struct {
++	Server    string `json:"server,omitempty"`    // nameserver that answered, as configured
++	LocalAddr string `json:"localAddr,omitempty"` // source address of the query, when its transport reports one
++	Interface string `json:"interface,omitempty"` // outbound interface the query was bound to
++	Cached    bool   `json:"cached,omitempty"`    // answered from the outbound's cache
+ }
+ 
+ func (m *Metadata) RemoteAddress() string {
+diff --git a/dns/client.go b/dns/client.go
+index 6362fe7..7498828 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -40,6 +40,9 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error)
+ 		return nil, err
+ 	}
+ 	defer conn.Close()
++	if trace := traceFromContext(ctx); trace != nil {
++		trace.exchangeDial(c.Address(), queryLocalAddr(conn))
++	}
+ 
+ 	// miekg/dns ExchangeContext doesn't respond to context cancel.
+ 	// this is a workaround
+@@ -71,6 +74,9 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error)
+ 				return
+ 			}
+ 			defer tcpConn.Close()
++			if trace := traceFromContext(ctx); trace != nil {
++				trace.exchangeDial(c.Address(), queryLocalAddr(tcpConn))
++			}
+ 			dConn.Conn = tcpConn
+ 			msg, _, err = dClient.ExchangeWithConn(m, dConn)
+ 		}
+diff --git a/dns/resolver.go b/dns/resolver.go
+index b8742f2..0020b73 100644
+--- a/dns/resolver.go
++++ b/dns/resolver.go
+@@ -26,8 +26,8 @@ type dnsClient interface {
+ }
+ 
+ type dnsCache interface {
+-	GetWithExpire(key string) (*D.Msg, time.Time, bool)
+-	SetWithExpire(key string, value *D.Msg, expire time.Time)
++	GetWithExpire(key string) (*cachedMsg, time.Time, bool)
++	SetWithExpire(key string, value *cachedMsg, expire time.Time)
+ 	Clear()
+ }
+ 
+@@ -153,11 +153,14 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
+ 	if len(m.Question) == 0 {
+ 		return nil, errors.New("should have one question at least")
+ 	}
++	refreshOutbound := traceOutbound(ctx)
+ 	continueFetch := false
+ 	defer func() {
+ 		if continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+ 			go func() {
+-				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
++				// The detached trace is not tied to any connection; it keeps
++				// the refreshed cache entry reporting the query that filled it.
++				ctx, cancel := context.WithTimeout(WithQueryTrace(context.Background(), NewQueryTrace(refreshOutbound)), resolver.DefaultDNSTimeout)
+ 				defer cancel()
+ 				_, _ = r.exchangeWithoutCache(ctx, m) // ignore result, just for putMsgToCache
+ 			}()
+@@ -166,7 +169,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
+ 
+ 	q := m.Question[0]
+ 	domain := msgToDomain(m)
+-	msg, expireTime, hit := getMsgFromCache(r.cache, q)
++	msg, answer, expireTime, hit := getMsgFromCache(r.cache, q)
+ 	if hit {
+ 		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
+ 		now := time.Now()
+@@ -177,6 +180,9 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
+ 			// updating TTL by subtracting common delta time from each DNS record
+ 			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
+ 		}
++		if trace := traceFromContext(ctx); trace != nil {
++			trace.cacheAnswered(answer)
++		}
+ 		return
+ 	}
+ 	return r.exchangeWithoutCache(ctx, m)
+@@ -189,7 +195,10 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
+ 	retryNum := 0
+ 	retryMax := 3
+ 	fn := func() (result *D.Msg, err error) {
+-		ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout) // reset timeout in singleflight
++		// Reset the timeout in singleflight, but keep the caller's query trace,
++		// so the exchange reports to the lookup that started it.
++		queryCtx := WithQueryTrace(context.Background(), traceFromContext(ctx))
++		ctx, cancel := context.WithTimeout(queryCtx, resolver.DefaultDNSTimeout)
+ 		defer cancel()
+ 		cache := false
+ 
+@@ -202,7 +211,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
+ 			}
+ 
+ 			if cache {
+-				putMsgToCache(r.cache, q, result)
++				putMsgToCache(ctx, r.cache, q, result)
+ 			}
+ 		}()
+ 
+@@ -244,6 +253,16 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
+ 	}
+ 
+ 	ret, err, shared := result.Val, result.Err, result.Shared
++	if err == nil && shared {
++		// This lookup was merged into an identical in-flight query. Report the
++		// answer of the query that filled the entry, unless an exchange of
++		// this lookup already reported one.
++		if trace := traceFromContext(ctx); trace != nil {
++			if entry, _, ok := r.cache.GetWithExpire(q.String()); ok {
++				trace.mergedAnswered(entry.answer)
++			}
++		}
++	}
+ 	if err != nil && !shared && ret.Opcode < retryMax { // retry
+ 		r.group.DoChan(q.String(), fn)
+ 	}
+@@ -491,9 +510,9 @@ func (config Config) newCache() dnsCache {
+ 	}
+ 	switch config.CacheAlgorithm {
+ 	case "arc":
+-		return arc.New(arc.WithSize[string, *D.Msg](config.CacheMaxSize))
++		return arc.New(arc.WithSize[string, *cachedMsg](config.CacheMaxSize))
+ 	default:
+-		return lru.New(lru.WithSize[string, *D.Msg](config.CacheMaxSize), lru.WithStale[string, *D.Msg](true))
++		return lru.New(lru.WithSize[string, *cachedMsg](config.CacheMaxSize), lru.WithStale[string, *cachedMsg](true))
+ 	}
+ }
+ 
+diff --git a/dns/util.go b/dns/util.go
+index 0a0c6e4..4e15967 100644
+--- a/dns/util.go
++++ b/dns/util.go
+@@ -47,43 +47,47 @@ func updateTTL(records []D.RR, ttl uint32) {
+ 
+ // getMsgFromCache returns a cached dns message if it exists, otherwise returns nil.
+ // the returned msg is a copy of the original msg, so it can be modified without affecting the original msg.
+-func getMsgFromCache(c dnsCache, q D.Question) (*D.Msg, time.Time, bool) {
+-	msg, expireTime, hit := c.GetWithExpire(q.String())
+-	if msg != nil {
+-		msg = msg.Copy() // never modify the original msg
++// answer reports how the query that filled the entry was answered.
++func getMsgFromCache(c dnsCache, q D.Question) (msg *D.Msg, answer queryAnswer, expireTime time.Time, hit bool) {
++	entry, expireTime, hit := c.GetWithExpire(q.String())
++	if entry == nil || entry.msg == nil {
++		return nil, queryAnswer{}, expireTime, hit
+ 	}
+-	return msg, expireTime, hit
++	return entry.msg.Copy(), entry.answer, expireTime, hit // never modify the original msg
+ }
+ 
+ // putMsgToCache puts a dns message into the cache.
+ // the msg is copied before being stored in the cache, so it can be modified without affecting the original msg.
+-func putMsgToCache(c dnsCache, q D.Question, msg *D.Msg) {
++func putMsgToCache(ctx context.Context, c dnsCache, q D.Question, msg *D.Msg) {
+ 	// skip dns cache for acme challenge
+ 	if q.Qtype == D.TypeTXT && strings.HasPrefix(q.Name, "_acme-challenge.") {
+ 		log.Debugln("[DNS] dns cache ignored because of acme challenge for: %s", q.Name)
+ 		return
+ 	}
+ 
+-	msg = msg.Copy() // never modify the original msg
++	entry := &cachedMsg{msg: msg.Copy()} // never modify the original msg
++	if trace := traceFromContext(ctx); trace != nil {
++		entry.answer.server, entry.answer.localAddr, _, _ = trace.Result()
++	}
+ 
+ 	// OPT RRs MUST NOT be cached, forwarded, or stored in or loaded from master files.
+-	msg.Extra = lo.Filter(msg.Extra, func(rr D.RR, index int) bool {
++	entry.msg.Extra = lo.Filter(entry.msg.Extra, func(rr D.RR, index int) bool {
+ 		return rr.Header().Rrtype != D.TypeOPT
+ 	})
+ 
+ 	var ttl uint32
+-	if msg.Rcode == D.RcodeServerFailure {
++	if entry.msg.Rcode == D.RcodeServerFailure {
+ 		// [...] a resolver MAY cache a server failure response.
+ 		// If it does so it MUST NOT cache it for longer than five (5) minutes [...]
+ 		ttl = serverFailureCacheTTL
+ 	} else {
+-		ttl = minimalTTL(lo.Concat(msg.Answer, msg.Ns, msg.Extra))
++		ttl = minimalTTL(lo.Concat(entry.msg.Answer, entry.msg.Ns, entry.msg.Extra))
+ 	}
+ 	if ttl == 0 {
+ 		return
+ 	}
+ 
+-	c.SetWithExpire(q.String(), msg, time.Now().Add(time.Duration(ttl)*time.Second))
++	c.SetWithExpire(q.String(), entry, time.Now().Add(time.Duration(ttl)*time.Second))
+ }
+ 
+ func setMsgTTL(msg *D.Msg, ttl uint32) {
+@@ -427,12 +431,18 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
+ 		fast.Go(func() (*D.Msg, error) {
+ 			log.Debugln("[DNS] resolve %s %s from %s", domain, qTypeStr, client.Address())
+ 			m, err := client.ExchangeContext(ctx, m)
+-			if err != nil {
+-				return nil, err
+-			} else if cache && (m.Rcode == D.RcodeServerFailure || m.Rcode == D.RcodeRefused) {
++			if err == nil && cache && (m.Rcode == D.RcodeServerFailure || m.Rcode == D.RcodeRefused) {
+ 				// currently, cache indicates whether this msg was from a RCode client,
+ 				// so we would ignore RCode errors from RCode clients.
+-				return nil, errors.New("server failure: " + D.RcodeToString[m.Rcode])
++				err = errors.New("server failure: " + D.RcodeToString[m.Rcode])
++			}
++			if trace := traceFromContext(ctx); trace != nil {
++				// one line per query that left through the outbound that owns this
++				// resolver, and the first answer reported to its connection
++				trace.exchangeDone(client.Address(), domain, m, err)
++			}
++			if err != nil {
++				return nil, err
+ 			}
+ 			log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(m), client.Address())
+ 			return m, nil

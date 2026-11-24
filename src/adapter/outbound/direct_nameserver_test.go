@@ -17,32 +17,51 @@ import (
 )
 
 // countingDNS answers every A query with answer and counts questions per name.
+// With servfail set it answers every question with SERVFAIL instead. It also
+// records the address each question arrived from.
 type countingDNS struct {
-	mu      sync.Mutex
-	queries map[string]int
-	answer  netip.Addr
-	addr    string
+	mu       sync.Mutex
+	queries  map[string]int
+	sources  map[string]string
+	answer   netip.Addr
+	addr     string
+	servfail bool
 }
 
 func startCountingDNS(t *testing.T, answer netip.Addr) *countingDNS {
+	return startCountingDNSOn(t, "127.0.0.1", answer)
+}
+
+func startCountingDNSOn(t *testing.T, host string, answer netip.Addr) *countingDNS {
+	return startDNSOn(t, host, answer, false)
+}
+
+// startFailingDNS counts its questions and fails every one of them.
+func startFailingDNS(t *testing.T, host string) *countingDNS {
+	return startDNSOn(t, host, netip.Addr{}, true)
+}
+
+func startDNSOn(t *testing.T, host string, answer netip.Addr, servfail bool) *countingDNS {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	pc, err := net.ListenPacket("udp", net.JoinHostPort(host, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &countingDNS{queries: map[string]int{}, answer: answer, addr: pc.LocalAddr().String()}
+	s := newCountingDNS(answer, pc.LocalAddr().String(), servfail)
 	server := &D.Server{PacketConn: pc, Handler: D.HandlerFunc(func(w D.ResponseWriter, req *D.Msg) {
 		m := new(D.Msg)
-		m.SetReply(req)
 		q := req.Question[0]
-		s.mu.Lock()
-		s.queries[q.Name]++
-		s.mu.Unlock()
-		if q.Qtype == D.TypeA {
-			m.Answer = append(m.Answer, &D.A{
-				Hdr: D.RR_Header{Name: q.Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 300},
-				A:   s.answer.AsSlice(),
-			})
+		s.record(q.Name, w.RemoteAddr())
+		if s.servfail {
+			m.SetRcode(req, D.RcodeServerFailure)
+		} else {
+			m.SetReply(req)
+			if q.Qtype == D.TypeA {
+				m.Answer = append(m.Answer, &D.A{
+					Hdr: D.RR_Header{Name: q.Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 300},
+					A:   s.answer.AsSlice(),
+				})
+			}
 		}
 		_ = w.WriteMsg(m)
 	})}
@@ -51,10 +70,35 @@ func startCountingDNS(t *testing.T, answer netip.Addr) *countingDNS {
 	return s
 }
 
+func newCountingDNS(answer netip.Addr, addr string, servfail bool) *countingDNS {
+	return &countingDNS{
+		queries:  map[string]int{},
+		sources:  map[string]string{},
+		answer:   answer,
+		addr:     addr,
+		servfail: servfail,
+	}
+}
+
+// record counts one question for name and remembers where it arrived from.
+func (s *countingDNS) record(name string, remote net.Addr) {
+	s.mu.Lock()
+	s.queries[name]++
+	s.sources[name] = remote.String()
+	s.mu.Unlock()
+}
+
 func (s *countingDNS) count(name string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.queries[D.Fqdn(name)]
+}
+
+// source returns the address the last question for name arrived from.
+func (s *countingDNS) source(name string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sources[D.Fqdn(name)]
 }
 
 func newDirect(t *testing.T, name string, extra map[string]any) C.Proxy {
@@ -156,19 +200,21 @@ func TestDirectNameserverTCPDial(t *testing.T) {
 }
 
 func startCountingTCPDNS(t *testing.T, answer netip.Addr) *countingDNS {
+	return startCountingTCPDNSOn(t, "127.0.0.1", answer)
+}
+
+func startCountingTCPDNSOn(t *testing.T, host string, answer netip.Addr) *countingDNS {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &countingDNS{queries: map[string]int{}, answer: answer, addr: ln.Addr().String()}
+	s := newCountingDNS(answer, ln.Addr().String(), false)
 	server := &D.Server{Listener: ln, Handler: D.HandlerFunc(func(w D.ResponseWriter, req *D.Msg) {
 		m := new(D.Msg)
 		m.SetReply(req)
 		q := req.Question[0]
-		s.mu.Lock()
-		s.queries[q.Name]++
-		s.mu.Unlock()
+		s.record(q.Name, w.RemoteAddr())
 		if q.Qtype == D.TypeA {
 			m.Answer = append(m.Answer, &D.A{
 				Hdr: D.RR_Header{Name: q.Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 300},
