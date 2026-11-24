@@ -142,3 +142,60 @@ func ValidFlatpakAppID(id string) bool {
 	}
 	return true
 }
+
+// SystemdUnitFromCgroupPath returns the systemd service or scope whose cgroup
+// holds path: the cgroup itself or its nearest ancestor named like one. Slices
+// only group units, and the cgroups below a unit's own (a container's
+// libpod-payload-… or runtime, say) belong to that unit. The name is returned
+// as systemd spells it, escapes included.
+func SystemdUnitFromCgroupPath(path string) (string, bool) {
+	for path != "" {
+		i := strings.LastIndexByte(path, '/')
+		name := path[i+1:]
+		if i < 0 {
+			path = ""
+		} else {
+			path = path[:i]
+		}
+		if strings.HasSuffix(name, ".service") || strings.HasSuffix(name, ".scope") {
+			if !ValidSystemdUnitName(name) {
+				return "", false
+			}
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// ValidSystemdUnitName reports whether name is a valid systemd service or
+// scope name which can have a cgroup, by the rules of unit_name_is_valid: at
+// most 255 characters of [A-Za-z0-9:_.\-] before the suffix, a non-empty
+// prefix, and at most one "@" followed by a non-empty instance. A template
+// such as getty@.service has no cgroup of its own.
+func ValidSystemdUnitName(name string) bool {
+	if len(name) > 255 {
+		return false
+	}
+	stem, ok := strings.CutSuffix(name, ".service")
+	if !ok {
+		if stem, ok = strings.CutSuffix(name, ".scope"); !ok {
+			return false
+		}
+	}
+	prefix, instance, templated := strings.Cut(stem, "@")
+	if prefix == "" || templated && instance == "" {
+		return false
+	}
+	for _, part := range []string{prefix, instance} {
+		for i := 0; i < len(part); i++ {
+			c := part[i]
+			switch {
+			case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			case c == ':', c == '_', c == '.', c == '-', c == '\\':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}

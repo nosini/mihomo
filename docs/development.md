@@ -100,4 +100,6 @@ metadata those outbounds record is
 `patches/0004-direct-nameserver-metadata.patch` with `src/dns/query_trace*.go`.
 `FLATPAK-APP` rules and the cgroup fields of connection metadata are
 `patches/0005-flatpak-app-rule.patch` with `src/component/process/cgroup*.go`
-and `src/rules/common/flatpak_app.go`.
+and `src/rules/common/flatpak_app.go`. `SYSTEMD-UNIT` rules and the
+`systemdUnit` metadata field are `patches/0006-systemd-unit-rule.patch` with
+`src/rules/common/systemd_unit.go`; they reuse that cgroup lookup.

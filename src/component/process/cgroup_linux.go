@@ -116,7 +116,7 @@ func (m *sockOwnerMap) noteCgroupUnavailable() {
 		return
 	}
 	m.cgroupWarned = true
-	log.Warnln("[Process] Can't attribute connections to cgroups, so FLATPAK-APP rules match nothing: %s", m.cgroupErr)
+	log.Warnln("[Process] Can't attribute connections to cgroups, so FLATPAK-APP and SYSTEMD-UNIT rules match nothing: %s", m.cgroupErr)
 }
 
 // lookupSockCgroup returns the cgroup ID recorded for a connection's owner.

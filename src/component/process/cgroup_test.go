@@ -84,3 +84,70 @@ func TestValidFlatpakAppID(t *testing.T) {
 		}
 	}
 }
+
+func TestSystemdUnitFromCgroupPath(t *testing.T) {
+	const user = "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+	const payload = "libpod-payload-8f7d2ed094aa54027a99d0d9c61b63a126b9cface581f34e65c2fff3152ed135"
+	for path, want := range map[string]string{
+		// A Quadlet container: its payload, and the pasta, conmon and
+		// fuse-overlayfs in runtime, belong to the service.
+		user + "jdownloader.service/" + payload: "jdownloader.service",
+		user + "jdownloader.service/runtime":    "jdownloader.service",
+		user + "jdownloader.service":            "jdownloader.service",
+		// podman run outside a unit, and an ad-hoc container's payload.
+		"/user.slice/user-1000.slice/user@1000.service/user.slice/podman-2494.scope":     "podman-2494.scope",
+		"/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-3b6c5387.scope": "libpod-3b6c5387.scope",
+		// The nearest unit wins over the user manager above it.
+		user + `app-flatpak-org.example.App-7.scope/sub`:           `app-flatpak-org.example.App-7.scope`,
+		"/user.slice/user-1000.slice/user@1000.service/init.scope": "init.scope",
+		"/system.slice/mihomo.service":                             "mihomo.service",
+		"/system.slice/system-getty.slice/getty@tty1.service":      "getty@tty1.service",
+		`/system.slice/dev-disk-by\x2duuid.service`:                `dev-disk-by\x2duuid.service`,
+		// Slices alone, or no unit.
+		"/user.slice/user-1000.slice": "",
+		"/machine.slice/x":            "",
+		"/":                           "",
+		"":                            "",
+		// The nearest unit-like name is invalid: unknown, not the one above.
+		user + "x.service/bad name.service": "",
+		user + "x.service/@i.service":       "",
+		// A drop-in-like name is not a unit; the user manager above is.
+		user + "x.service.d/sub": "user@1000.service",
+	} {
+		got, ok := SystemdUnitFromCgroupPath(path)
+		if ok != (want != "") || got != want {
+			t.Errorf("%s: %q, %v, want %q", path, got, ok, want)
+		}
+	}
+}
+
+func TestValidSystemdUnitName(t *testing.T) {
+	long := make([]byte, 247) // 255 characters with ".service"
+	for i := range long {
+		long[i] = 'a'
+	}
+	for name, want := range map[string]bool{
+		"jdownloader.service":       true,
+		"podman-2494.scope":         true,
+		"getty@tty1.service":        true,
+		`dev-disk-by\x2duuid.scope`: true,
+		"a:b_c.d.service":           true,
+		string(long) + ".service":   true,
+		string(long) + "a.service":  false,
+		"jdownloader":               false,
+		"user.slice":                false,
+		"sockets.target":            false,
+		".service":                  false,
+		"getty@.service":            false,
+		"a@b@c.service":             false,
+		"@x.service":                false,
+		"has space.service":         false,
+		"a/b.service":               false,
+		"*.service":                 false,
+		"jdownloader.SERVICE":       false,
+	} {
+		if got := ValidSystemdUnitName(name); got != want {
+			t.Errorf("%q: %v, want %v", name, got, want)
+		}
+	}
+}

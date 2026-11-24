@@ -94,6 +94,45 @@ Connections attributed this way show the cgroup in `cgroupPath`, relative to the
 cgroupfs root, and the app in `flatpakApp`, beside `process` and `processPath`
 in the connection list; log lines add `flatpak=<app ID>` to the source.
 
+### Systemd units and Podman containers
+
+`SYSTEMD-UNIT` matches the systemd service or scope whose cgroup holds the
+connection's owner:
+
+```yaml
+rules:
+  - SYSTEMD-UNIT,jdownloader.service,PROXY
+  - SYSTEMD-UNIT,backup.service,DIRECT
+```
+
+The unit is the nearest component of the owner's cgroup path named like a
+service or scope: the cgroup itself or its closest such ancestor. Slices are
+skipped, and cgroups below a unit's own, such as a container's
+`libpod-payload-…` or `runtime`, belong to that unit. If that name isn't a valid
+unit name, the unit is unknown and no component further up is tried. Names are
+compared exactly, as systemd spells them, including escapes such as `\x2d`. The
+payload must be a full service or scope name; a template without an instance,
+a slice or another unit type is rejected when the configuration loads.
+Connections show the unit in `systemdUnit` in the connection list.
+
+A rootless Podman container's connections leave the host through its pasta
+process, so they are owned by pasta. How the container is started decides
+which unit that pasta runs in:
+
+| Started as | pasta | Unit |
+|---|---|---|
+| Quadlet `NAME.container` | one per container | `NAME.service` (pasta in its `runtime` cgroup) |
+| `systemd-run --user --unit=NAME podman run …` | one per container | `NAME.service` |
+| `podman run` from a shell | one per container | `podman-<PID>.scope`, not named after the container |
+| Quadlet `NAME.pod` | one per pod, shared by its containers | `NAME-pod.service` |
+| `podman pod create` from a shell | one per pod, shared by its containers | `podman-<PID>.scope` |
+| `--network` naming a user-defined network | one shared by all such containers | `rootless-netns-<ID>.scope` |
+
+So a Quadlet container is routed by its service name, and the containers of a
+Quadlet pod together by the pod's service. Containers on a
+user-defined network share one pasta, and they can't be told apart this way.
+`SYSTEMD-UNIT` identifies any cooperative unit, not only containers.
+
 With `-exec-paths`, the loader also records the path of each cgroup its hooks
 see (feature bit 1, the `cgroup_paths` map), and mihomo names cgroups from it
 alone: it needs no access to cgroupfs, and a scope that has ended is still
@@ -111,11 +150,11 @@ The owner's cgroup record is only used when it belongs to the owner record of
 the same connection, since the maps are evicted independently.
 
 With a loader that predates owner cgroups, or without `-exec-paths` and a
-cgroupfs mihomo can't list, nothing is attributed and `FLATPAK-APP` never matches; once such a rule is
+cgroupfs mihomo can't list, nothing is attributed and `FLATPAK-APP` and `SYSTEMD-UNIT` never match; once such a rule is
 configured, the missing map is logged once per loader start:
 
 ```text
-[Process] Can't attribute connections to cgroups, so FLATPAK-APP rules match nothing: the socketowner loader doesn't publish owner cgroups (update it)
+[Process] Can't attribute connections to cgroups, so FLATPAK-APP and SYSTEMD-UNIT rules match nothing: the socketowner loader doesn't publish owner cgroups (update it)
 ```
 
 and a cgroupfs that can't be listed once per distinct error:
@@ -127,9 +166,9 @@ and a cgroupfs that can't be listed once per distinct error:
 A cgroup name is attribution for cooperative apps, not a security boundary.
 Any process can start a scope with any name through its systemd user manager
 (`systemd-run --user --scope --unit=app-flatpak-…`) or move itself within the
-cgroups delegated to it, just as it can choose its process name. The cgroup
-lookup is kept separate from the rule, in `process.FindCgroup`, so that rules
-on cgroup paths or systemd units can use it as well.
+cgroups delegated to it, just as it can choose its process name. A unit name can be
+chosen the same way. The cgroup lookup is kept separate from the rules, in
+`process.FindCgroup`, which both rules use.
 
 ## Lookup health
 
@@ -288,11 +327,16 @@ that they are attributed, that a process outside them and a scope whose name
 isn't a valid app ID are not, and that a removed scope is still named with
 `-exec-paths` and unknown without. It needs a
 user with a running systemd user manager; with an installed Flatpak app that
-has `python3`, a second test checks a real `flatpak run`:
+has `python3`, a second test checks a real `flatpak run`. With an image that
+has busybox `nc` and that the user has pulled, a third test starts a rootless
+Quadlet container from `$XDG_RUNTIME_DIR/containers/systemd`, which connects to
+a host listener, and checks that the host socket belongs to its pasta and to the
+container's service:
 
 ```sh
 sudo env SOCKOWNER_MAP=/sys/fs/bpf/mihomo/maps/conn_owners \
     SOCKOWNER_SCOPE_USER=<user> SOCKOWNER_FLATPAK_APP=org.flatpak.Builder \
+    SOCKOWNER_PODMAN_IMAGE=docker.io/library/alpine:latest \
     ./bin/process.test -test.v -test.run Cgroup
 ```
 

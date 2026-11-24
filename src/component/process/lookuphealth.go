@@ -39,7 +39,7 @@ type MapsHealth struct {
 }
 
 // CgroupHealth reports attribution of connections to the owner's cgroup,
-// which FLATPAK-APP rules use.
+// which FLATPAK-APP and SYSTEMD-UNIT rules use.
 type CgroupHealth struct {
 	// Available is true while the owner-cgroup map is open and cgroups can
 	// be named: from the loader's cgroup paths, or else from cgroupfs, which

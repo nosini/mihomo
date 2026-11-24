@@ -231,6 +231,64 @@ func TestCgroupFlatpakRun(t *testing.T) {
 	}
 }
 
+// With SOCKOWNER_PODMAN_IMAGE naming an image with busybox nc that the user of
+// SOCKOWNER_SCOPE_USER has pulled, a rootless Quadlet container connects to a
+// host listener. The host socket is its pasta's, which runs in the
+// container's service, so the connection belongs to that unit.
+func TestCgroupPodmanQuadlet(t *testing.T) {
+	requireCgroupMap(t)
+	image := os.Getenv("SOCKOWNER_PODMAN_IMAGE")
+	if image == "" {
+		t.Skip("set SOCKOWNER_PODMAN_IMAGE to an image with busybox nc, pulled by SOCKOWNER_SCOPE_USER")
+	}
+	prefix := userSession(t)
+	l, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	port := l.Addr().(*net.TCPAddr).Port
+	name := fmt.Sprintf("sockowner-quadlet-%d", os.Getpid())
+	// Quadlet also reads units from $XDG_RUNTIME_DIR/containers/systemd,
+	// which keeps the user's home untouched.
+	quadlet := fmt.Sprintf("[Container]\nImage=%s\nExec=sh -c 'sleep 60 | nc host.containers.internal %d'\n", image, port)
+	// run passes its arguments to the script as $0, $1, ...
+	run := func(script string, args ...string) {
+		argv := append(append([]string{}, prefix...), "sh", "-c", script)
+		argv = append(argv, args...)
+		if out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput(); err != nil {
+			t.Fatalf("%s: %v: %s", script, err, out)
+		}
+	}
+	const dir = `"$XDG_RUNTIME_DIR/containers/systemd"`
+	run(`mkdir -p `+dir+` && printf '%s' "$1" > `+dir+`/"$0.container" && systemctl --user daemon-reload && systemctl --user start "$0.service"`, name, quadlet)
+	defer run(`systemctl --user stop "$0.service"; systemctl --user reset-failed "$0.service" 2>/dev/null; rm -f `+dir+`/"$0.container" && systemctl --user daemon-reload`, name)
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		if c, err := l.Accept(); err == nil {
+			accepted <- c
+		}
+	}()
+	var c net.Conn
+	select {
+	case c = <-accepted:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the container didn't connect")
+	}
+	defer c.Close()
+	src := c.RemoteAddr().(*net.TCPAddr).AddrPort()
+	_, owner, err := FindProcessName("tcp", src.Addr(), int(src.Port()))
+	path, ok := FindCgroup("tcp", src.Addr(), int(src.Port()))
+	unit, _ := SystemdUnitFromCgroupPath(path)
+	t.Logf("quadlet %s: owner %q (%v), cgroup %s (%v) -> %q", name, owner, err, path, ok, unit)
+	if !strings.Contains(filepath.Base(owner), "pasta") {
+		t.Fatalf("owner %q is not pasta", owner)
+	}
+	if unit != name+".service" {
+		t.Fatalf("cgroup %q, unit %q", path, unit)
+	}
+}
+
 // The health snapshot reports cgroup attribution as available.
 func TestCgroupHealth(t *testing.T) {
 	requireCgroupMap(t)
