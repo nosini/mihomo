@@ -18,7 +18,10 @@ import (
 // abi_version advertises it (docs/socketowner.md).
 const (
 	connCgroupsMap        = "conn_cgroups"
+	cgroupPathsMap        = "cgroup_paths"
+	cgroupPathSize        = 1024
 	featureConnCgroups    = 1 << 0
+	featureCgroupPaths    = 1 << 1
 	defaultCgroupRoot     = "/sys/fs/cgroup"
 	cgroup2SuperMagic     = 0x63677270
 	cgroupRewalkInterval  = time.Second
@@ -42,21 +45,63 @@ func (v *sockCgroupValue) belongsTo(owner sockOwnerValue) bool {
 	return owner.Tgid != 0 && v.Tgid == owner.Tgid && v.BootNs == owner.BootNs && v.CgroupID != 0
 }
 
-// openCgroupMapLocked opens conn_cgroups beside the open socket-owner map,
-// when the loader advertises it.
+// cgroupPathValue is a path recorded in cgroup_paths, relative to the cgroup
+// v2 root.
+type cgroupPathValue struct {
+	Len  int32 // bytes in Path including the NUL, or a negative errno
+	_    uint32
+	Path [cgroupPathSize]byte
+}
+
+func (v *cgroupPathValue) path() (string, bool) {
+	if v.Len < 2 || int(v.Len) > len(v.Path) || v.Path[0] != '/' {
+		return "", false
+	}
+	return string(v.Path[:v.Len-1]), true
+}
+
+// openCgroupMapLocked opens conn_cgroups, and cgroup_paths where the loader
+// records it (with -exec-paths), beside the open socket-owner map.
 func (m *sockOwnerMap) openCgroupMapLocked() {
 	if m.features&featureConnCgroups == 0 {
 		m.cgroupErr = "the socketowner loader doesn't publish owner cgroups (update it)"
 		return
 	}
-	fd, err := openBPFMap(filepath.Join(filepath.Dir(m.path), connCgroupsMap), unix.BPF_MAP_TYPE_LRU_HASH,
+	dir := filepath.Dir(m.path)
+	fd, err := openBPFMap(filepath.Join(dir, connCgroupsMap), unix.BPF_MAP_TYPE_LRU_HASH,
 		uint32(unsafe.Sizeof(sockOwnerKey{})), sockCgroupValue{})
 	if err != nil {
 		m.cgroupErr = err.Error()
 		return
 	}
+	if m.features&featureCgroupPaths != 0 {
+		pathsFd, err := openBPFMap(filepath.Join(dir, cgroupPathsMap), unix.BPF_MAP_TYPE_LRU_HASH, 8, cgroupPathValue{})
+		if err != nil {
+			unix.Close(fd)
+			m.cgroupErr = err.Error()
+			return
+		}
+		m.pathsFd = pathsFd
+	}
 	m.cgroupsFd = fd
 	m.cgroupErr = ""
+}
+
+// recordedCgroupPath returns the path the loader recorded for a cgroup ID.
+// usesMap is false when the loader records no paths, so that the caller
+// names the cgroup through cgroupfs instead.
+func (m *sockOwnerMap) recordedCgroupPath(id uint64) (path string, ok, usesMap bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.pathsFd < 0 {
+		return "", false, false
+	}
+	var v cgroupPathValue
+	if !lookupBPFMap(m.pathsFd, &id, &v) {
+		return "", false, true
+	}
+	path, ok = v.path()
+	return path, ok, true
 }
 
 // noteCgroupUnavailable logs once per pin that cgroup attribution, which a
@@ -111,7 +156,12 @@ func findCgroup(network string, ip netip.Addr, srcPort int) (string, bool) {
 		lookupCounters.cgroupUnknown.Add(1)
 		return "", false
 	}
-	path, ok := cgroupPaths.path(id)
+	// A loader that records paths knows every cgroup its hooks saw, so a
+	// missing entry stays unknown rather than sending mihomo to cgroupfs.
+	path, ok, usesMap := sockOwners.recordedCgroupPath(id)
+	if !usesMap {
+		path, ok = cgroupPaths.path(id)
+	}
 	if !ok {
 		lookupCounters.cgroupUnknown.Add(1)
 		return "", false
@@ -271,11 +321,18 @@ func walkCgroupDir(fd int, path string, depth int, buf []byte, byID map[uint64]s
 // mapsHealth, which has refreshed the publication point.
 func (m *sockOwnerMap) cgroupHealth() CgroupHealth {
 	m.mu.RLock()
-	health := CgroupHealth{MapOpen: m.cgroupsFd >= 0, Root: cgroupPaths.root}
+	health := CgroupHealth{MapOpen: m.cgroupsFd >= 0, PathsMapOpen: m.pathsFd >= 0}
 	if m.fd >= 0 && m.cgroupsFd < 0 {
 		health.MapError = m.cgroupErr
 	}
 	m.mu.RUnlock()
+	if health.PathsMapOpen {
+		health.Source = "bpf"
+		health.Available = health.MapOpen
+		return health
+	}
+	health.Source = "cgroupfs"
+	health.Root = cgroupPaths.root
 	known, err := cgroupPaths.health()
 	health.KnownCgroups = known
 	if err != nil {

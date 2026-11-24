@@ -41,18 +41,26 @@ type MapsHealth struct {
 // CgroupHealth reports attribution of connections to the owner's cgroup,
 // which FLATPAK-APP rules use.
 type CgroupHealth struct {
-	// Available is true while the owner-cgroup map is open and cgroupfs
+	// Available is true while the owner-cgroup map is open and cgroups can
+	// be named: from the loader's cgroup paths, or else from cgroupfs, which
 	// could be read the last time.
 	Available bool `json:"available"`
 	// MapOpen is true while the loader's owner-cgroup map is open.
 	MapOpen bool `json:"mapOpen"`
-	// MapError says why the map isn't open, such as a loader that doesn't
-	// publish it; empty while it is open or the socket-owner map is closed.
+	// PathsMapOpen is true while the loader's cgroup paths are open; they
+	// are recorded with -exec-paths.
+	PathsMapOpen bool `json:"pathsMapOpen"`
+	// MapError says why the maps aren't open, such as a loader that doesn't
+	// publish them; empty while they are or the socket-owner map is closed.
 	MapError string `json:"mapError,omitempty"`
-	// Root is the cgroupfs mount cgroup IDs are resolved in.
-	Root string `json:"root"`
+	// Source is where cgroups are named: "bpf" for the loader's paths,
+	// "cgroupfs" for a listing of Root.
+	Source string `json:"source"`
+	// Root is the cgroupfs mount cgroup IDs are resolved in, when Source is
+	// cgroupfs.
+	Root string `json:"root,omitempty"`
 	// KnownCgroups is the number of cgroups found in the last walk of Root.
-	KnownCgroups int `json:"knownCgroups"`
+	KnownCgroups int `json:"knownCgroups,omitempty"`
 	// RootError is the error from the last walk of Root, if it failed.
 	RootError string `json:"rootError,omitempty"`
 }

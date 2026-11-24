@@ -47,11 +47,11 @@ func TestFlatpakAppFromCgroupPath(t *testing.T) {
 		"":                                               "",
 		// Lookalikes: only the nearest app-flatpak-* component counts, and
 		// only as a whole name.
-		user + `app-flatpak-org.example.Outer-1.scope/app-flatpak-bad-2.scope`:       "",
+		user + `app-flatpak-org.example.Outer-1.scope/app-flatpak-bad-2.scope`:            "",
 		user + `app-flatpak-org.example.Outer-1.scope/app-flatpak-org.example.In-2.scope`: "org.example.In",
-		user + `my-app-flatpak-org.example.App-7.scope`:                              "",
-		user + `app-flatpak-org.example.App-7.scope.d/x`:                             "",
-		`/app-flatpak-org.example.App-7.scope`:                                       "org.example.App",
+		user + `my-app-flatpak-org.example.App-7.scope`:                                   "",
+		user + `app-flatpak-org.example.App-7.scope.d/x`:                                  "",
+		`/app-flatpak-org.example.App-7.scope`:                                            "org.example.App",
 	} {
 		got, ok := FlatpakAppFromCgroupPath(path)
 		if ok != (want != "") || got != want {

@@ -167,8 +167,10 @@ type sockOwnerMap struct {
 	fd       int
 	tasksFd  int
 	recentFd int
-	// cgroupsFd is conn_cgroups, open while the loader advertises it.
+	// cgroupsFd is conn_cgroups and pathsFd cgroup_paths, each open while
+	// the loader advertises it.
 	cgroupsFd  int
+	pathsFd    int
 	features   uint32
 	netns      uint64
 	pinned     pinnedMapSet
@@ -183,7 +185,7 @@ type sockOwnerMap struct {
 	cgroupWarned bool
 }
 
-var sockOwners = &sockOwnerMap{path: DefaultSockOwnerMap, fd: -1, tasksFd: -1, recentFd: -1, cgroupsFd: -1}
+var sockOwners = &sockOwnerMap{path: DefaultSockOwnerMap, fd: -1, tasksFd: -1, recentFd: -1, cgroupsFd: -1, pathsFd: -1}
 
 // SetSockOwnerMap sets the pinned socket-owner map to use; an empty path
 // turns the lookup off.
@@ -228,7 +230,7 @@ func SockOwnerOnly() bool {
 
 func (m *sockOwnerMap) closeLocked() {
 	m.features = 0
-	for _, fd := range []*int{&m.fd, &m.tasksFd, &m.recentFd, &m.cgroupsFd} {
+	for _, fd := range []*int{&m.fd, &m.tasksFd, &m.recentFd, &m.cgroupsFd, &m.pathsFd} {
 		if *fd >= 0 {
 			unix.Close(*fd)
 			*fd = -1

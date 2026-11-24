@@ -94,17 +94,24 @@ Connections attributed this way show the cgroup in `cgroupPath`, relative to the
 cgroupfs root, and the app in `flatpakApp`, beside `process` and `processPath`
 in the connection list; log lines add `flatpak=<app ID>` to the source.
 
-mihomo resolves a cgroup ID by listing `/sys/fs/cgroup`, whose directory inode
-numbers are the IDs, so it needs to see the host's cgroupfs (the hardened
-service binds it read-only). It keeps the paths it found and lists the tree
-again for an ID it doesn't know: straight away for an ID newer than all known
-ones, at most once a second otherwise. A scope removed before it was ever seen
-can't be named, and the connection then has no app. The owner's cgroup record
-is only used when it belongs to the owner record of the same connection, since
-the two maps are evicted independently.
+With `-exec-paths`, the loader also records the path of each cgroup its hooks
+see (feature bit 1, the `cgroup_paths` map), and mihomo names cgroups from it
+alone: it needs no access to cgroupfs, and a scope that has ended is still
+named. An ID missing there stays unknown.
 
-With a loader that predates owner cgroups, or a cgroupfs mihomo can't list,
-nothing is attributed and `FLATPAK-APP` never matches; once such a rule is
+A loader without `-exec-paths` records IDs only. mihomo then resolves an ID by
+listing `/sys/fs/cgroup`, whose directory inode numbers are the IDs, so it needs
+to see the host's cgroupfs, outside any private cgroup namespace (the hardened
+service binds it read-only in `/proc` mode). It keeps the paths it found and
+lists the tree again for an ID it doesn't know: straight away for an ID newer
+than all known ones, at most once a second otherwise. A scope removed before it
+was ever seen can't be named, and the connection then has no app.
+
+The owner's cgroup record is only used when it belongs to the owner record of
+the same connection, since the maps are evicted independently.
+
+With a loader that predates owner cgroups, or without `-exec-paths` and a
+cgroupfs mihomo can't list, nothing is attributed and `FLATPAK-APP` never matches; once such a rule is
 configured, the missing map is logged once per loader start:
 
 ```text
@@ -152,8 +159,8 @@ one map lookup for the Wine heartbeat.
   "cgroups": {
     "available": true,
     "mapOpen": true,
-    "root": "/sys/fs/cgroup",
-    "knownCgroups": 143
+    "pathsMapOpen": true,
+    "source": "bpf"
   },
   "counters": {
     "bpfHits": 21,
@@ -191,8 +198,9 @@ for example after installing a loader with an unsupported map interface:
   "cgroups": {
     "available": false,
     "mapOpen": false,
+    "pathsMapOpen": false,
+    "source": "cgroupfs",
     "root": "/sys/fs/cgroup",
-    "knownCgroups": 0,
     "rootError": "permission denied"
   },
   "counters": {
@@ -228,12 +236,13 @@ The fields:
   record match `WINE-PROCESS-*` rules as `wine-unknown`, and the counter below
   counts the lookups refused for that reason.
 - `cgroups.available` is true while connections can be attributed to cgroups
-  for `FLATPAK-APP`: `cgroups.mapOpen` says the loader's owner-cgroup map is
-  open, and the last listing of `cgroups.root` succeeded, finding
-  `cgroups.knownCgroups` cgroups. `cgroups.mapError` says why the map isn't open
-  while the socket-owner map is, such as a loader that doesn't publish it, and
-  `cgroups.rootError` why the cgroupfs couldn't be listed. Answering lists the
-  cgroupfs once if no lookup has yet.
+  for `FLATPAK-APP`. `cgroups.mapOpen` says the loader's owner-cgroup map is
+  open and `cgroups.pathsMapOpen` its cgroup paths; `cgroups.mapError` says why
+  they aren't while the socket-owner map is, such as a loader that doesn't
+  publish them. `cgroups.source` is `bpf` when names come from those paths and
+  `cgroupfs` otherwise; then the last listing of `cgroups.root` must have
+  succeeded, finding `cgroups.knownCgroups` cgroups, or `cgroups.rootError` says
+  why it didn't. Answering lists the cgroupfs once if no lookup has yet.
 - The counters grow from process start and are never reset. `bpfHits` and
   `bpfMisses` count the lookups that consulted the maps; `procFallbacks` counts
   the ones that went through netlink and the `/proc` search instead, which never
@@ -276,7 +285,8 @@ sudo env SOCKOWNER_MAP=/sys/fs/bpf/mihomo/maps/conn_owners \
 `-test.run Cgroup` covers owner cgroups. Its scope test starts processes in
 transient scopes of a user's systemd manager, named like Flatpak's, and checks
 that they are attributed, that a process outside them and a scope whose name
-isn't a valid app ID are not, and that a removed scope is unknown. It needs a
+isn't a valid app ID are not, and that a removed scope is still named with
+`-exec-paths` and unknown without. It needs a
 user with a running systemd user manager; with an installed Flatpak app that
 has `python3`, a second test checks a real `flatpak run`:
 

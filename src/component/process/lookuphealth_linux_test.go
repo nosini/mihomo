@@ -266,8 +266,8 @@ func TestHealthJSON(t *testing.T) {
 		Cgroups: CgroupHealth{
 			Available:    true,
 			MapOpen:      true,
-			Root:         "/sys/fs/cgroup",
-			KnownCgroups: 143,
+			PathsMapOpen: true,
+			Source:       "bpf",
 		},
 		Counters: Counters{BPFHits: 21, BPFMisses: 3, ProcFallbacks: 2, WineKnown: 5, WineUnknown: 1, CgroupKnown: 4, CgroupUnknown: 17},
 	}
@@ -278,7 +278,7 @@ func TestHealthJSON(t *testing.T) {
 	want := `{"supported":true,"bpfOnly":false,"mapPath":"/run/mihomo-bpf/conn_owners",` +
 		`"maps":{"open":true,"abiVersion":1,"execMapsOpen":true},` +
 		`"wine":{"present":true,"abiVersion":2,"heartbeatAgeSeconds":1,"stale":false},` +
-		`"cgroups":{"available":true,"mapOpen":true,"root":"/sys/fs/cgroup","knownCgroups":143},` +
+		`"cgroups":{"available":true,"mapOpen":true,"pathsMapOpen":true,"source":"bpf"},` +
 		`"counters":{"bpfHits":21,"bpfMisses":3,"procFallbacks":2,"wineKnown":5,"wineUnknown":1,"wineStaleRefused":0,` +
 		`"cgroupKnown":4,"cgroupUnknown":17}}`
 	if string(got) != want {

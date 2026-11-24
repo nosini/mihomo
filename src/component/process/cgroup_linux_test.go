@@ -16,10 +16,13 @@ import (
 // socketowner/docs/map-interface.md.
 func TestSockCgroupABILayout(t *testing.T) {
 	for name, tc := range map[string]struct{ got, want uintptr }{
-		"size":   {unsafe.Sizeof(sockCgroupValue{}), 24},
-		"tgid":   {unsafe.Offsetof(sockCgroupValue{}.Tgid), 0},
-		"time":   {unsafe.Offsetof(sockCgroupValue{}.BootNs), 8},
-		"cgroup": {unsafe.Offsetof(sockCgroupValue{}.CgroupID), 16},
+		"size":        {unsafe.Sizeof(sockCgroupValue{}), 24},
+		"tgid":        {unsafe.Offsetof(sockCgroupValue{}.Tgid), 0},
+		"time":        {unsafe.Offsetof(sockCgroupValue{}.BootNs), 8},
+		"cgroup":      {unsafe.Offsetof(sockCgroupValue{}.CgroupID), 16},
+		"path size":   {unsafe.Sizeof(cgroupPathValue{}), 1032},
+		"path length": {unsafe.Offsetof(cgroupPathValue{}.Len), 0},
+		"path bytes":  {unsafe.Offsetof(cgroupPathValue{}.Path), 8},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s: %d, want %d", name, tc.got, tc.want)
@@ -46,6 +49,31 @@ func TestSockCgroupBelongsTo(t *testing.T) {
 	} {
 		if got := tc.cg.belongsTo(tc.owner); got != tc.want {
 			t.Errorf("%s: %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestCgroupPathDecode(t *testing.T) {
+	set := func(s string, n int32) *cgroupPathValue {
+		v := &cgroupPathValue{Len: n}
+		copy(v.Path[:], s)
+		return v
+	}
+	for name, tc := range map[string]struct {
+		v    *cgroupPathValue
+		want string
+	}{
+		"path":       {set("/user.slice/a.scope\x00junk", 20), "/user.slice/a.scope"},
+		"root":       {set("/\x00", 2), "/"},
+		"too long":   {set("/a", -36), ""},
+		"empty":      {set("", 1), ""},
+		"zero":       {set("", 0), ""},
+		"overflow":   {set("/a", 1025), ""},
+		"not rooted": {set("a\x00", 2), ""},
+	} {
+		got, ok := tc.v.path()
+		if ok != (tc.want != "") || got != tc.want {
+			t.Errorf("%s: %q, %v, want %q", name, got, ok, tc.want)
 		}
 	}
 }

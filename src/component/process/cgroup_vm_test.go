@@ -170,7 +170,8 @@ func TestCgroupFlatpakScope(t *testing.T) {
 		t.Fatalf("invalid app ID: cgroup %q, app %q", path, app)
 	}
 
-	// The scope ends with its process. Forget the walk that found it.
+	// The scope ends with its process. The loader's recorded path still
+	// names it; a cgroupfs listing that hadn't seen it can't.
 	unit = fmt.Sprintf("app-flatpak-org.example.Gone-%d.scope", instance)
 	src, stop = connectFrom(t, l, scoped(unit))
 	stop()
@@ -188,7 +189,15 @@ func TestCgroupFlatpakScope(t *testing.T) {
 	cgroupPaths.mu.Lock()
 	cgroupPaths.byID, cgroupPaths.walkedAt = nil, time.Time{}
 	cgroupPaths.mu.Unlock()
-	if path, app := findApp(t, src); path != "" || app != "" {
+	sockOwners.mu.RLock()
+	recorded := sockOwners.pathsFd >= 0
+	sockOwners.mu.RUnlock()
+	path, app = findApp(t, src)
+	t.Logf("removed scope (paths recorded: %v): %s -> %q", recorded, path, app)
+	if recorded && (!strings.HasSuffix(path, "/"+unit) || app != "org.example.Gone") {
+		t.Fatalf("removed scope: cgroup %q, app %q", path, app)
+	}
+	if !recorded && (path != "" || app != "") {
 		t.Fatalf("removed scope: cgroup %q, app %q", path, app)
 	}
 	if _, ok := lookupSockCgroup("tcp", src.Addr(), int(src.Port())); !ok {
@@ -226,7 +235,8 @@ func TestCgroupFlatpakRun(t *testing.T) {
 func TestCgroupHealth(t *testing.T) {
 	requireCgroupMap(t)
 	h := LookupHealth().Cgroups
-	if !h.Available || !h.MapOpen || h.KnownCgroups == 0 || h.RootError != "" {
+	if !h.Available || !h.MapOpen || (h.Source == "cgroupfs" && (h.KnownCgroups == 0 || h.RootError != "")) ||
+		(h.Source == "bpf") != h.PathsMapOpen {
 		t.Fatalf("%+v", h)
 	}
 }
