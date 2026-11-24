@@ -123,7 +123,7 @@ which unit that pasta runs in:
 |---|---|---|
 | Quadlet `NAME.container` | one per container | `NAME.service` (pasta in its `runtime` cgroup) |
 | `systemd-run --user --unit=NAME podman run …` | one per container | `NAME.service` |
-| `podman run` from a shell | one per container | `podman-<PID>.scope`, not named after the container |
+| `podman run` from a shell | one per container | `podman-<PID>.scope`, or the scope of the terminal it was started from, such as `vte-spawn-<UUID>.scope`; neither is named after the container |
 | Quadlet `NAME.pod` | one per pod, shared by its containers | `NAME-pod.service` |
 | `podman pod create` from a shell | one per pod, shared by its containers | `podman-<PID>.scope` |
 | `--network` naming a user-defined network | one shared by all such containers | `rootless-netns-<ID>.scope` |
@@ -131,6 +131,8 @@ which unit that pasta runs in:
 So a Quadlet container is routed by its service name, and the containers of a
 Quadlet pod together by the pod's service. Containers on a
 user-defined network share one pasta, and they can't be told apart this way.
+A container started from a shell has no stable unit name; to route it on its
+own, start it as a Quadlet or with `systemd-run --user --unit=NAME`.
 `SYSTEMD-UNIT` identifies any cooperative unit, not only containers.
 
 With `-exec-paths`, the loader also records the path of each cgroup its hooks
