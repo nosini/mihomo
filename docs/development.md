@@ -92,7 +92,7 @@ update. Record the selected revision in this document with the submodule pin.
 Never commit local modifications inside the upstream submodule.
 
 Connection statistics and TLS hostname discovery are maintained on their
-respective feature branches. Process and Wine attribution are part of `main`.
-Nameservers for direct outbounds are maintained on the
-`direct-outbound-nameserver` branch as `patches/0002-direct-outbound-nameserver.patch`
-and `src/adapter/outbound/direct_nameserver*.go`.
+respective feature branches. Process and Wine attribution and nameservers for
+direct outbounds are part of `main`; the latter is
+`patches/0002-direct-outbound-nameserver.patch` with
+`src/adapter/outbound/direct_nameserver*.go`.

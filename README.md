@@ -6,6 +6,8 @@ Wine connections, including sandboxes using pasta. It supports `PROCESS-NAME`
 and `PROCESS-PATH` rules without giving mihomo permission to inspect other
 processes, and `WINE-PROCESS-NAME` and `WINE-PROCESS-PATH` rules for the Windows
 program behind a relay. Wine clients whose full path is unavailable can match by name.
+Direct outbounds can also have their own nameservers, queried through the
+outbound.
 
 Connection statistics and TLS hostname discovery remain on their separate
 experimental branches and are excluded from `main`.
@@ -57,8 +59,8 @@ before adding a blanket `wine-unknown` rejection.
 
 ## Nameservers for direct outbounds
 
-This branch also lets a `type: direct` outbound send its own DNS queries through
-itself. With `nameserver` set, lookups for its connections use those servers and
+A `type: direct` outbound can send its own DNS queries through itself. With
+`nameserver` set, lookups for its connections use those servers and
 leave with the outbound's `interface-name` and `routing-mark`, so a DNS server
 that chooses its upstream by client address sees the same source as the
 traffic. Each outbound keeps its own cache.
