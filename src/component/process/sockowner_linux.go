@@ -170,6 +170,10 @@ type sockOwnerMap struct {
 	netns      uint64
 	pinned     pinnedMapSet
 	execWarned bool
+	// openErr and execErr are the last errors from opening the owner and
+	// exec-path maps, for the health snapshot; empty while they are open.
+	openErr string
+	execErr string
 }
 
 var sockOwners = &sockOwnerMap{path: DefaultSockOwnerMap, fd: -1, tasksFd: -1, recentFd: -1}
@@ -186,6 +190,7 @@ func SetSockOwnerMap(path string) {
 	m.closeLocked()
 	m.path = path
 	m.pinned.reset(path)
+	m.openErr, m.execErr = "", ""
 	m.execWarned = false
 	wineFlowMaps.reset()
 }
@@ -260,8 +265,13 @@ func (m *sockOwnerMap) refreshLocked() bool {
 		m.fd, m.netns = fd, netns
 		return nil
 	})
-	if err != nil && m.pinned.warnOnce(err) {
-		log.Warnln("[Process] Can't use socket owners recorded in %s: %v", m.path, err)
+	if err != nil {
+		m.openErr = err.Error()
+		if m.pinned.warnOnce(err) {
+			log.Warnln("[Process] Can't use socket owners recorded in %s: %v", m.path, err)
+		}
+	} else if m.fd >= 0 {
+		m.openErr = ""
 	}
 	if m.fd < 0 {
 		return changed
@@ -279,12 +289,14 @@ func (m *sockOwnerMap) refreshLocked() bool {
 	err = m.openExecMapsLocked(dir)
 	switch {
 	case err == nil:
+		m.execErr = ""
 		log.Infoln("[Process] Using socket owners and executables recorded in %s", dir)
 		return changed
 	case !errors.Is(err, unix.ENOENT) && !m.execWarned:
 		log.Warnln("[Process] Can't use executables recorded in %s: %v", dir, err)
 		m.execWarned = true
 	}
+	m.execErr = err.Error()
 	if changed {
 		log.Infoln("[Process] Using socket owners recorded in %s", m.path)
 	}
@@ -456,14 +468,22 @@ func lookupSockOwner(network string, ip netip.Addr, srcPort int) (sockOwnerValue
 		return sockOwnerValue{}, false
 	}
 	var value sockOwnerValue
+	// Only lookups that consulted the maps count: the health snapshot tells
+	// the ones the closed maps never answered from the fallback counter.
+	consulted := false
 	found := sockOwners.lookup(func(fd int, netns uint64) bool {
+		consulted = true
 		key.Netns = netns
 		return lookupBPFMap(fd, &key, &value)
 	})
-	if !found || value.Tgid == 0 {
-		return sockOwnerValue{}, false
+	if found && value.Tgid != 0 {
+		lookupCounters.bpfHits.Add(1)
+		return value, true
 	}
-	return value, true
+	if consulted {
+		lookupCounters.bpfMisses.Add(1)
+	}
+	return sockOwnerValue{}, false
 }
 
 var (

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -54,12 +55,16 @@ type wineFlowValue struct {
 // wineFlows opens its maps as sockOwners does, separately: they come and go
 // with one sandbox's publisher, not with the socketowner loader. netns is
 // mihomo's network namespace cookie, which keys the records as in conn_owners.
+// healthState and healthChecked remember the last publication sample, so
+// changes are logged once and lookups sample at most every wineHeartbeatLimit.
 type wineFlows struct {
-	mu          sync.RWMutex
-	flowsFd     int
-	heartbeatFd int
-	netns       uint64
-	pinned      pinnedMapSet
+	mu            sync.RWMutex
+	flowsFd       int
+	heartbeatFd   int
+	netns         uint64
+	pinned        pinnedMapSet
+	healthState   atomic.Int32
+	healthChecked atomic.Int64
 }
 
 var wineFlowMaps = &wineFlows{flowsFd: -1, heartbeatFd: -1}
@@ -78,6 +83,9 @@ func (w *wineFlows) reset() {
 	defer w.mu.Unlock()
 	w.closeLocked()
 	w.pinned.reset("")
+	// A changed map path makes the next sample a first observation, so it
+	// logs nothing.
+	w.healthState.Store(int32(wineStateUnknown))
 }
 
 func (w *wineFlows) openLocked(dir string) error {
@@ -112,6 +120,18 @@ func (w *wineFlows) refreshLocked(dir string) bool {
 	return changed
 }
 
+// heartbeatAgeLocked returns the age of the Wine publisher's heartbeat. ok is
+// false when it can't be read, which the reader treats as not live.
+func (w *wineFlows) heartbeatAgeLocked() (time.Duration, bool) {
+	var slot uint32
+	var beat uint64
+	var now unix.Timespec
+	if !lookupBPFMap(w.heartbeatFd, &slot, &beat) || unix.ClockGettime(unix.CLOCK_BOOTTIME, &now) != nil {
+		return 0, false
+	}
+	return time.Duration(now.Nano() - int64(beat)), true
+}
+
 // lookup returns the record of a flow, given its key without the namespace.
 // live is false if its publisher stopped beating, which leaves records
 // unmaintained: a port may have changed hands.
@@ -135,14 +155,10 @@ func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, 
 	if !lookupBPFMap(w.flowsFd, key, &value) {
 		return value, false, false
 	}
-	var slot uint32
-	var beat uint64
-	var now unix.Timespec
-	if lookupBPFMap(w.heartbeatFd, &slot, &beat) && unix.ClockGettime(unix.CLOCK_BOOTTIME, &now) == nil {
-		// The publisher writes host CLOCK_BOOTTIME. A beat from the future
-		// means another clock (a time namespace), so it proves nothing.
-		age := now.Nano() - int64(beat)
-		live = age >= 0 && age < int64(wineHeartbeatLimit)
+	// The publisher writes host CLOCK_BOOTTIME; a beat from the future means
+	// another clock, so it proves nothing.
+	if age, ok := w.heartbeatAgeLocked(); ok {
+		live = age >= 0 && age < wineHeartbeatLimit
 	}
 	return value, live, true
 }
@@ -172,16 +188,26 @@ func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path str
 	if !enabled {
 		return "", "", false
 	}
+	// Sample the publication state while looking flows up, so a stopped
+	// publisher is noticed even without the /process-lookup route.
+	noteWineHealth(dir)
 	value, live, found := wineFlowMaps.lookup(&key, dir)
 	if !found {
 		return "", "", false
 	}
-	if !live || value.Status != wineStatusKnown || uint32(key.Proto) != value.Protocol {
+	if !live {
+		lookupCounters.wineStaleRefused.Add(1)
+		return WineUnknown, WineUnknown, true
+	}
+	if value.Status != wineStatusKnown || uint32(key.Proto) != value.Protocol {
+		lookupCounters.wineUnknown.Add(1)
 		return WineUnknown, WineUnknown, true
 	}
 	if name, path, ok = wineImage(&value); !ok {
+		lookupCounters.wineUnknown.Add(1)
 		return WineUnknown, WineUnknown, true
 	}
+	lookupCounters.wineKnown.Add(1)
 	return name, path, true
 }
 
