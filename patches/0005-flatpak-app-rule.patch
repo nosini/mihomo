@@ -1,0 +1,107 @@
+diff --git a/constant/metadata.go b/constant/metadata.go
+index aa997cb..bb07465 100644
+--- a/constant/metadata.go
++++ b/constant/metadata.go
+@@ -6,6 +6,7 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"strconv"
++	"strings"
+ )
+ 
+ // SOCKS address types as defined in RFC 1928 section 5.
+@@ -222,6 +223,11 @@ type Metadata struct {
+ 	WineProcess     string `json:"wineProcess,omitempty"`
+ 	WineProcessPath string `json:"wineProcessPath,omitempty"`
+ 
++	// The cgroup v2 path of the process owning the socket, and the Flatpak
++	// app whose scope it is in
++	CgroupPath string `json:"cgroupPath,omitempty"`
++	FlatpakApp string `json:"flatpakApp,omitempty"`
++
+ 	// How a direct outbound with its own nameserver list resolved the
+ 	// destination of this connection, when it did
+ 	OutboundDNS *OutboundDNS `json:"outboundDns,omitempty"`
+@@ -255,8 +261,14 @@ func (m *Metadata) SourceDetail() string {
+ 		return fmt.Sprintf("%s", MihomoName)
+ 	}
+ 
+-	if m.WineProcess != "" {
+-		detail := "wine=" + m.WineProcess
++	if m.WineProcess != "" || m.FlatpakApp != "" {
++		var detail string
++		if m.WineProcess != "" {
++			detail = "wine=" + m.WineProcess
++		}
++		if m.FlatpakApp != "" {
++			detail = strings.TrimPrefix(detail+", flatpak="+m.FlatpakApp, ", ")
++		}
+ 		if m.Process != "" {
+ 			detail = m.Process + ", " + detail
+ 		}
+diff --git a/constant/rule.go b/constant/rule.go
+index f7e6d41..71d32b2 100644
+--- a/constant/rule.go
++++ b/constant/rule.go
+@@ -46,6 +46,7 @@ const (
+ 	WineProcessPathRegex
+ 	WineProcessNameWildcard
+ 	WineProcessPathWildcard
++	FlatpakApp
+ )
+ 
+ type RuleType int
+@@ -136,6 +137,8 @@ func (rt RuleType) String() string {
+ 		return "WineProcessNameWildcard"
+ 	case WineProcessPathWildcard:
+ 		return "WineProcessPathWildcard"
++	case FlatpakApp:
++		return "FlatpakApp"
+ 	default:
+ 		return "Unknown"
+ 	}
+diff --git a/docs/config.yaml b/docs/config.yaml
+index bf9ab63..e15d926 100644
+--- a/docs/config.yaml
++++ b/docs/config.yaml
+@@ -2028,6 +2028,12 @@ rules:
+   # sandbox's pasta). A program that can't be established is wine-unknown.
+   - AND,((PROCESS-NAME-REGEX,^game-pasta(\.avx2)?$),(WINE-PROCESS-NAME,game.exe)),DIRECT
+   - WINE-PROCESS-PATH-WILDCARD,C:\Games\*,DIRECT
++  # Linux：socketowner 记录连接所属进程的 cgroup 时，FLATPAK-APP 按 flatpak run 为应用创建的
++  # systemd scope 匹配 Flatpak 应用 ID（区分大小写）。仅用于识别配合的应用，并非安全边界
++  # Linux: when socketowner records the cgroup of each connection's owner, FLATPAK-APP matches
++  # the Flatpak app ID (case-sensitive) from the systemd scope flatpak run starts the app in.
++  # This identifies cooperative apps; it is not a security boundary.
++  - FLATPAK-APP,org.jdownloader.JDownloader,DIRECT
+   # 当满足条件是 TCP 或 UDP 流量时，使用名为 sub-rule-name1 的规则集
+   - SUB-RULE,(OR,((NETWORK,TCP),(NETWORK,UDP))),sub-rule-name1
+   - SUB-RULE,(AND,((NETWORK,UDP))),sub-rule-name2
+diff --git a/rules/parser.go b/rules/parser.go
+index b35a264..a34218d 100644
+--- a/rules/parser.go
++++ b/rules/parser.go
+@@ -79,6 +79,8 @@ func ParseRule(tp, payload, target string, params []string, subRules map[string]
+ 		parsed, parseErr = RC.NewProcess(payload, target, C.WineProcessNameWildcard)
+ 	case "WINE-PROCESS-PATH-WILDCARD":
+ 		parsed, parseErr = RC.NewProcess(payload, target, C.WineProcessPathWildcard)
++	case "FLATPAK-APP":
++		parsed, parseErr = RC.NewFlatpakApp(payload, target)
+ 	case "NETWORK":
+ 		parsed, parseErr = RC.NewNetworkType(payload, target)
+ 	case "UID":
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index ed980a2..98170c4 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -382,6 +382,10 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 						metadata.WineProcess = name
+ 						metadata.WineProcessPath = path
+ 					}
++					if path, ok := process.FindCgroup(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort)); ok {
++						metadata.CgroupPath = path
++						metadata.FlatpakApp, _ = process.FlatpakAppFromCgroupPath(path)
++					}
+ 				} else {
+ 					// check package names
+ 					pkg, err := process.FindPackageName(metadata)

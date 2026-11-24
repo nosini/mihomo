@@ -98,3 +98,6 @@ direct outbounds are part of `main`; the latter is
 `src/adapter/outbound/direct_nameserver*.go`, and the verifiable DNS
 metadata those outbounds record is
 `patches/0004-direct-nameserver-metadata.patch` with `src/dns/query_trace*.go`.
+`FLATPAK-APP` rules and the cgroup fields of connection metadata are
+`patches/0005-flatpak-app-rule.patch` with `src/component/process/cgroup*.go`
+and `src/rules/common/flatpak_app.go`.

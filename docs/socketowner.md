@@ -68,6 +68,62 @@ not depend on the loader's Go module or cilium/ebpf.
 Loader releases and mihomo releases need not have matching version
 numbers; their supported map ABI must match.
 
+## Flatpak apps
+
+Loaders that publish owner cgroups (feature bit 0 of `abi_version`, the
+`conn_cgroups` map) let mihomo name the cgroup v2 of the process that owns a
+connection. `FLATPAK-APP` matches the Flatpak app whose scope that cgroup is
+in:
+
+```yaml
+rules:
+  - FLATPAK-APP,org.jdownloader.JDownloader,PROXY
+```
+
+`flatpak run` in a desktop session starts each app in a transient systemd scope,
+`app-flatpak-<app ID>-<instance>.scope`, with the app ID escaped as a unit name
+(`-` becomes `\x2d`). Older Flatpak versions used the unescaped ID and the
+process ID; both forms are recognised. Only the owner's own cgroup or its
+nearest ancestor named `app-flatpak-…` counts. When that name isn't a valid
+scope for a valid app ID, the app is unknown, and no component further up is
+tried. App IDs are compared exactly, as Flatpak does; a rule whose payload isn't
+a valid app ID is rejected when the configuration loads. The lookup runs where
+process lookup runs, so `find-process-mode: off` turns the rule off too.
+
+Connections attributed this way show the cgroup in `cgroupPath`, relative to the
+cgroupfs root, and the app in `flatpakApp`, beside `process` and `processPath`
+in the connection list; log lines add `flatpak=<app ID>` to the source.
+
+mihomo resolves a cgroup ID by listing `/sys/fs/cgroup`, whose directory inode
+numbers are the IDs, so it needs to see the host's cgroupfs (the hardened
+service binds it read-only). It keeps the paths it found and lists the tree
+again for an ID it doesn't know: straight away for an ID newer than all known
+ones, at most once a second otherwise. A scope removed before it was ever seen
+can't be named, and the connection then has no app. The owner's cgroup record
+is only used when it belongs to the owner record of the same connection, since
+the two maps are evicted independently.
+
+With a loader that predates owner cgroups, or a cgroupfs mihomo can't list,
+nothing is attributed and `FLATPAK-APP` never matches; once such a rule is
+configured, the missing map is logged once per loader start:
+
+```text
+[Process] Can't attribute connections to cgroups, so FLATPAK-APP rules match nothing: the socketowner loader doesn't publish owner cgroups (update it)
+```
+
+and a cgroupfs that can't be listed once per distinct error:
+
+```text
+[Process] Can't read cgroup names from /sys/fs/cgroup: permission denied
+```
+
+A cgroup name is attribution for cooperative apps, not a security boundary.
+Any process can start a scope with any name through its systemd user manager
+(`systemd-run --user --scope --unit=app-flatpak-…`) or move itself within the
+cgroups delegated to it, just as it can choose its process name. The cgroup
+lookup is kept separate from the rule, in `process.FindCgroup`, so that rules
+on cgroup paths or systemd units can use it as well.
+
 ## Lookup health
 
 `GET /process-lookup` on the external controller reports whether process lookup
@@ -93,13 +149,21 @@ one map lookup for the Wine heartbeat.
     "heartbeatAgeSeconds": 1,
     "stale": false
   },
+  "cgroups": {
+    "available": true,
+    "mapOpen": true,
+    "root": "/sys/fs/cgroup",
+    "knownCgroups": 143
+  },
   "counters": {
     "bpfHits": 21,
     "bpfMisses": 3,
     "procFallbacks": 2,
     "wineKnown": 5,
     "wineUnknown": 1,
-    "wineStaleRefused": 0
+    "wineStaleRefused": 0,
+    "cgroupKnown": 4,
+    "cgroupUnknown": 17
   }
 }
 ```
@@ -124,13 +188,22 @@ for example after installing a loader with an unsupported map interface:
     "abiVersion": 0,
     "stale": false
   },
+  "cgroups": {
+    "available": false,
+    "mapOpen": false,
+    "root": "/sys/fs/cgroup",
+    "knownCgroups": 0,
+    "rootError": "permission denied"
+  },
   "counters": {
     "bpfHits": 0,
     "bpfMisses": 0,
     "procFallbacks": 0,
     "wineKnown": 0,
     "wineUnknown": 0,
-    "wineStaleRefused": 0
+    "wineStaleRefused": 0,
+    "cgroupKnown": 0,
+    "cgroupUnknown": 0
   }
 }
 ```
@@ -154,11 +227,19 @@ The fields:
   reuses the reader's five-second limit: while it is set, flows with a Wine
   record match `WINE-PROCESS-*` rules as `wine-unknown`, and the counter below
   counts the lookups refused for that reason.
+- `cgroups.available` is true while connections can be attributed to cgroups
+  for `FLATPAK-APP`: `cgroups.mapOpen` says the loader's owner-cgroup map is
+  open, and the last listing of `cgroups.root` succeeded, finding
+  `cgroups.knownCgroups` cgroups. `cgroups.mapError` says why the map isn't open
+  while the socket-owner map is, such as a loader that doesn't publish it, and
+  `cgroups.rootError` why the cgroupfs couldn't be listed. Answering lists the
+  cgroupfs once if no lookup has yet.
 - The counters grow from process start and are never reset. `bpfHits` and
   `bpfMisses` count the lookups that consulted the maps; `procFallbacks` counts
   the ones that went through netlink and the `/proc` search instead, which never
   happens with `bpfOnly`. `wineKnown` and `wineUnknown` count the Wine records
-  found, by whether the Windows program could be established.
+  found, by whether the Windows program could be established. `cgroupKnown` and
+  `cgroupUnknown` count cgroup lookups by whether they named a cgroup.
 
 Wine publication problems are also logged, once per change rather than per
 lookup. A warning says the heartbeat went stale or that the maps disappeared
@@ -190,6 +271,19 @@ make test-process
 make test-vm
 sudo env SOCKOWNER_MAP=/sys/fs/bpf/mihomo/maps/conn_owners \
     ./bin/process.test -test.v -test.run 'SockOwner|ExecPath|ExecMaps'
+```
+
+`-test.run Cgroup` covers owner cgroups. Its scope test starts processes in
+transient scopes of a user's systemd manager, named like Flatpak's, and checks
+that they are attributed, that a process outside them and a scope whose name
+isn't a valid app ID are not, and that a removed scope is unknown. It needs a
+user with a running systemd user manager; with an installed Flatpak app that
+has `python3`, a second test checks a real `flatpak run`:
+
+```sh
+sudo env SOCKOWNER_MAP=/sys/fs/bpf/mihomo/maps/conn_owners \
+    SOCKOWNER_SCOPE_USER=<user> SOCKOWNER_FLATPAK_APP=org.flatpak.Builder \
+    ./bin/process.test -test.v -test.run Cgroup
 ```
 
 A dedicated loader `-pin` directory can be used with the corresponding

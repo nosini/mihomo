@@ -12,10 +12,11 @@ type Health struct {
 	BPFOnly bool `json:"bpfOnly"`
 	// MapPath is the configured socket-owner map, empty when BPF lookup is
 	// disabled.
-	MapPath  string     `json:"mapPath"`
-	Maps     MapsHealth `json:"maps"`
-	Wine     WineHealth `json:"wine"`
-	Counters Counters   `json:"counters"`
+	MapPath  string       `json:"mapPath"`
+	Maps     MapsHealth   `json:"maps"`
+	Wine     WineHealth   `json:"wine"`
+	Cgroups  CgroupHealth `json:"cgroups"`
+	Counters Counters     `json:"counters"`
 }
 
 // MapsHealth reports the socket-owner maps the reader uses.
@@ -35,6 +36,25 @@ type MapsHealth struct {
 	// ExecMapsError is the last error from opening the exec-path maps;
 	// empty while they are open.
 	ExecMapsError string `json:"execMapsError,omitempty"`
+}
+
+// CgroupHealth reports attribution of connections to the owner's cgroup,
+// which FLATPAK-APP rules use.
+type CgroupHealth struct {
+	// Available is true while the owner-cgroup map is open and cgroupfs
+	// could be read the last time.
+	Available bool `json:"available"`
+	// MapOpen is true while the loader's owner-cgroup map is open.
+	MapOpen bool `json:"mapOpen"`
+	// MapError says why the map isn't open, such as a loader that doesn't
+	// publish it; empty while it is open or the socket-owner map is closed.
+	MapError string `json:"mapError,omitempty"`
+	// Root is the cgroupfs mount cgroup IDs are resolved in.
+	Root string `json:"root"`
+	// KnownCgroups is the number of cgroups found in the last walk of Root.
+	KnownCgroups int `json:"knownCgroups"`
+	// RootError is the error from the last walk of Root, if it failed.
+	RootError string `json:"rootError,omitempty"`
 }
 
 // WineHealth reports the Wine observer's maps and heartbeat.
@@ -64,6 +84,10 @@ type Counters struct {
 	WineKnown        uint64 `json:"wineKnown"`
 	WineUnknown      uint64 `json:"wineUnknown"`
 	WineStaleRefused uint64 `json:"wineStaleRefused"`
+	// CgroupKnown and CgroupUnknown count cgroup lookups that named a
+	// cgroup and those that didn't.
+	CgroupKnown   uint64 `json:"cgroupKnown"`
+	CgroupUnknown uint64 `json:"cgroupUnknown"`
 }
 
 // LookupHealth returns the snapshot for the /process-lookup route.

@@ -26,3 +26,8 @@ func SockOwnerOnly() bool { return sockOwnerOnly }
 func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path string, ok bool) {
 	return "", "", false
 }
+
+// Cgroups are attributed only on Linux.
+func findCgroup(network string, ip netip.Addr, srcPort int) (string, bool) {
+	return "", false
+}

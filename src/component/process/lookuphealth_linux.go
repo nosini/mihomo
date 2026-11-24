@@ -17,6 +17,8 @@ var lookupCounters struct {
 	wineKnown        atomic.Uint64
 	wineUnknown      atomic.Uint64
 	wineStaleRefused atomic.Uint64
+	cgroupKnown      atomic.Uint64
+	cgroupUnknown    atomic.Uint64
 }
 
 // lookupHealth returns the state of process lookup through the BPF maps.
@@ -29,6 +31,7 @@ func lookupHealth() *Health {
 		MapPath:   SockOwnerMap(),
 	}
 	h.Maps = sockOwners.mapsHealth()
+	h.Cgroups = sockOwners.cgroupHealth()
 	if dir, ok := wineFlowsDir(h.MapPath); ok {
 		state, age, beatRead := wineFlowMaps.sampleHealth(dir)
 		h.Wine = wineHealth(state, age, beatRead)
@@ -40,6 +43,8 @@ func lookupHealth() *Health {
 		WineKnown:        lookupCounters.wineKnown.Load(),
 		WineUnknown:      lookupCounters.wineUnknown.Load(),
 		WineStaleRefused: lookupCounters.wineStaleRefused.Load(),
+		CgroupKnown:      lookupCounters.cgroupKnown.Load(),
+		CgroupUnknown:    lookupCounters.cgroupUnknown.Load(),
 	}
 	return h
 }

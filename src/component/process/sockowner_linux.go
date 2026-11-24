@@ -161,22 +161,29 @@ func (v *execPathValue) ownedBy(owner sockOwnerValue) bool {
 // executable comes from the exec-path maps where the loader pinned them, and
 // from /proc otherwise.
 type sockOwnerMap struct {
-	mu         sync.RWMutex
-	path       string
-	only       bool
-	fd         int
-	tasksFd    int
-	recentFd   int
+	mu       sync.RWMutex
+	path     string
+	only     bool
+	fd       int
+	tasksFd  int
+	recentFd int
+	// cgroupsFd is conn_cgroups, open while the loader advertises it.
+	cgroupsFd  int
+	features   uint32
 	netns      uint64
 	pinned     pinnedMapSet
 	execWarned bool
 	// openErr and execErr are the last errors from opening the owner and
 	// exec-path maps, for the health snapshot; empty while they are open.
-	openErr string
-	execErr string
+	openErr   string
+	execErr   string
+	cgroupErr string
+	// cgroupWarned is set once the missing cgroup map has been reported
+	// for the open pin.
+	cgroupWarned bool
 }
 
-var sockOwners = &sockOwnerMap{path: DefaultSockOwnerMap, fd: -1, tasksFd: -1, recentFd: -1}
+var sockOwners = &sockOwnerMap{path: DefaultSockOwnerMap, fd: -1, tasksFd: -1, recentFd: -1, cgroupsFd: -1}
 
 // SetSockOwnerMap sets the pinned socket-owner map to use; an empty path
 // turns the lookup off.
@@ -190,8 +197,8 @@ func SetSockOwnerMap(path string) {
 	m.closeLocked()
 	m.path = path
 	m.pinned.reset(path)
-	m.openErr, m.execErr = "", ""
-	m.execWarned = false
+	m.openErr, m.execErr, m.cgroupErr = "", "", ""
+	m.execWarned, m.cgroupWarned = false, false
 	wineFlowMaps.reset()
 }
 
@@ -220,7 +227,8 @@ func SockOwnerOnly() bool {
 }
 
 func (m *sockOwnerMap) closeLocked() {
-	for _, fd := range []*int{&m.fd, &m.tasksFd, &m.recentFd} {
+	m.features = 0
+	for _, fd := range []*int{&m.fd, &m.tasksFd, &m.recentFd, &m.cgroupsFd} {
 		if *fd >= 0 {
 			unix.Close(*fd)
 			*fd = -1
@@ -258,11 +266,11 @@ func (m *sockOwnerMap) lookup(fn func(fd int, netns uint64) bool) bool {
 
 func (m *sockOwnerMap) refreshLocked() bool {
 	changed, err := m.pinned.refresh(m.path, m.closeLocked, func() error {
-		fd, netns, err := openSockOwnerMap(m.path)
+		fd, netns, features, err := openSockOwnerMap(m.path)
 		if err != nil {
 			return err
 		}
-		m.fd, m.netns = fd, netns
+		m.fd, m.netns, m.features = fd, netns, features
 		return nil
 	})
 	if err != nil {
@@ -277,8 +285,12 @@ func (m *sockOwnerMap) refreshLocked() bool {
 		return changed
 	}
 	if changed {
-		m.execWarned = false
-	} else if m.tasksFd >= 0 {
+		m.execWarned, m.cgroupWarned = false, false
+	}
+	if m.cgroupsFd < 0 {
+		m.openCgroupMapLocked()
+	}
+	if !changed && m.tasksFd >= 0 {
 		return changed
 	}
 	// The loader pins the exec-path maps before the socket-owner map, so
@@ -317,46 +329,53 @@ func (m *sockOwnerMap) openExecMapsLocked(dir string) error {
 	return nil
 }
 
-func openSockOwnerMap(path string) (int, uint64, error) {
-	if err := checkSockOwnerABI(filepath.Dir(path)); err != nil {
-		return -1, 0, err
-	}
-	netns, err := currentNetnsCookie()
+func openSockOwnerMap(path string) (fd int, netns uint64, features uint32, err error) {
+	features, err = checkSockOwnerABI(filepath.Dir(path))
 	if err != nil {
-		return -1, 0, err
+		return -1, 0, 0, err
 	}
-	fd, err := openBPFMap(path, unix.BPF_MAP_TYPE_LRU_HASH, uint32(unsafe.Sizeof(sockOwnerKey{})), sockOwnerValue{})
+	netns, err = currentNetnsCookie()
 	if err != nil {
-		return -1, 0, err
+		return -1, 0, 0, err
 	}
-	return fd, netns, nil
+	fd, err = openBPFMap(path, unix.BPF_MAP_TYPE_LRU_HASH, uint32(unsafe.Sizeof(sockOwnerKey{})), sockOwnerValue{})
+	if err != nil {
+		return -1, 0, 0, err
+	}
+	return fd, netns, features, nil
 }
 
 // checkABI rejects an absent or incompatible marker before interpreting
-// records in maps with the given ABI version.
-func checkABI(path string, want uint32) error {
+// records in maps with the given ABI version. It also returns the optional
+// features at key 1, which loaders that predate them don't have.
+func checkABI(path string, want uint32) (features uint32, err error) {
 	fd, err := openBPFMap(path, unix.BPF_MAP_TYPE_ARRAY, 4, uint32(0))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer unix.Close(fd)
 	var key, version uint32
 	if !lookupBPFMap(fd, &key, &version) {
-		return fmt.Errorf("cannot read ABI version from %s", path)
+		return 0, fmt.Errorf("cannot read ABI version from %s", path)
 	}
 	if version != want {
-		return fmt.Errorf("unsupported ABI v%d in %s (need v%d)", version, path, want)
+		return 0, fmt.Errorf("unsupported ABI v%d in %s (need v%d)", version, path, want)
 	}
-	return nil
+	key = 1
+	if !lookupBPFMap(fd, &key, &features) {
+		features = 0
+	}
+	return features, nil
 }
 
 // checkSockOwnerABI rejects absent or incompatible markers before interpreting
 // records. Map type and size checks below additionally protect lookup buffers.
-func checkSockOwnerABI(dir string) error {
-	if err := checkABI(filepath.Join(dir, "abi_version"), sockOwnerABIVersion); err != nil {
-		return fmt.Errorf("socketowner ABI (install a compatible socketowner loader): %w", err)
+func checkSockOwnerABI(dir string) (uint32, error) {
+	features, err := checkABI(filepath.Join(dir, "abi_version"), sockOwnerABIVersion)
+	if err != nil {
+		return 0, fmt.Errorf("socketowner ABI (install a compatible socketowner loader): %w", err)
 	}
-	return nil
+	return features, nil
 }
 
 // openBPFMap opens the map pinned at path read-only and checks that it has

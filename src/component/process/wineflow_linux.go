@@ -89,7 +89,7 @@ func (w *wineFlows) reset() {
 }
 
 func (w *wineFlows) openLocked(dir string) error {
-	if err := checkABI(filepath.Join(dir, wineABIMap), wineABIVersion); err != nil {
+	if _, err := checkABI(filepath.Join(dir, wineABIMap), wineABIVersion); err != nil {
 		return fmt.Errorf("Wine ABI: %w", err)
 	}
 	netns, err := currentNetnsCookie()

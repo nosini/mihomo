@@ -464,7 +464,7 @@ func TestSockOwnerABIVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	if err := checkSockOwnerABI(dir); err == nil {
+	if _, err := checkSockOwnerABI(dir); err == nil {
 		t.Fatal("accepted maps without an ABI marker")
 	}
 	for _, version := range []uint32{0, 2, sockOwnerABIVersion} {
@@ -486,7 +486,7 @@ func TestSockOwnerABIVersion(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer os.Remove(pin)
-			if err := checkSockOwnerABI(dir); (err == nil) != (version == sockOwnerABIVersion) {
+			if _, err := checkSockOwnerABI(dir); (err == nil) != (version == sockOwnerABIVersion) {
 				t.Fatalf("ABI v%d: %v", version, err)
 			}
 		})
