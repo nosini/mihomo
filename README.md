@@ -1,16 +1,23 @@
 # Mihomo with Linux process attribution
 
-This build of [Mihomo](https://github.com/MetaCubeX/mihomo) adds Linux process
-lookup through socketowner's BPF maps and identifies Windows programs behind
-Wine connections, including sandboxes using pasta. It supports `PROCESS-NAME`
-and `PROCESS-PATH` rules without giving mihomo permission to inspect other
-processes, and `WINE-PROCESS-NAME` and `WINE-PROCESS-PATH` rules for the Windows
-program behind a relay. Wine clients whose full path is unavailable can match by name.
-Direct outbounds can also have their own nameservers, queried through the
-outbound.
+This build of [Mihomo](https://github.com/MetaCubeX/mihomo) adds:
 
-Connection statistics and TLS hostname discovery remain on their separate
-experimental branches and are excluded from `main`.
+- Linux process lookup through socketowner's BPF maps, so `PROCESS-NAME` and
+  `PROCESS-PATH` rules work without giving mihomo permission to inspect other
+  processes.
+- `WINE-PROCESS-NAME` and `WINE-PROCESS-PATH` rules for the Windows program
+  behind a Wine connection, including one relayed by a sandbox's pasta.
+  Programs whose full path is unavailable can match by name.
+- `FLATPAK-APP` rules for the Flatpak app that owns a connection, and
+  `SYSTEMD-UNIT` rules for its systemd service or scope, which also routes a
+  rootless Podman container started as a Quadlet.
+- `GET /process-lookup` on the external controller, which reports whether
+  process lookup is working and where its answers come from.
+- Nameservers for direct outbounds, queried through the outbound itself, with
+  the answering server shown in the connection list.
+
+Connection statistics and TLS hostname discovery stay on their own branches and
+are not part of `main`.
 
 ## Build and install
 
@@ -43,15 +50,21 @@ provides systemd units, map permissions and SELinux policy. Its Wine observer
 unit is optional and must be enabled separately.
 
 See [process lookup configuration](docs/socketowner.md) for the map settings,
-fallback behavior and integration tests. For example, once the observer is
-installed and running:
+fallback behavior, rule details and integration tests. For example, with the
+loader installed and, for the Wine rule, the observer running:
 
 ```yaml
 rules:
   - WINE-PROCESS-NAME,example.exe,REJECT
+  - FLATPAK-APP,org.example.App,PROXY
+  - SYSTEMD-UNIT,backup.service,DIRECT
 ```
 
-Native socketowner and Wine attribution support cooperative applications; they
+`FLATPAK-APP` and `SYSTEMD-UNIT` need a socketowner loader that records owner
+cgroups. The same documentation explains how rootless Podman containers map to
+systemd units.
+
+Process, Wine, Flatpak and unit attribution support cooperative applications; they
 are not a security boundary against a program forging its own identity. Review
 unknown-flow and DNS behavior in the
 [Wine observer documentation](https://github.com/nosini/socketowner/tree/main/wine)
