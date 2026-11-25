@@ -199,23 +199,20 @@ func wineFlowsDir(ownerPath string) (string, bool) {
 
 // findWineProcess names the Windows program behind a flow, which is reported
 // beside the process owning the socket, such as a sandbox's relay. ok is false
-// when no Wine record covers it, including when the socket's recorded owner is
-// neither the record's server nor its client. An unusable record gives
-// WineUnknown, so that a rule for a Windows program is never passed for lack
-// of its identity.
+// when no Wine record covers it. An unusable record gives WineUnknown, so that
+// a rule for a Windows program is never passed for lack of its identity.
+//
+// connect() lets sockets with different peers share an ephemeral port, and
+// under TUN every host socket has the same source address. The record of the
+// flow's exact destination is preferred; one keyed by the source alone, from
+// an observer without those or for a destination peers miss, can be another
+// socket's. Its TGIDs can't tell: a relayed record names the sandbox's
+// wineserver and client, not the pasta which owns the socket.
 func findWineProcess(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (name, path string, ok bool) {
 	key, ok := newSockOwnerKey(network, ip, srcPort)
 	if !ok {
 		return "", "", false
 	}
-	// connect() lets sockets with different peers share an ephemeral port,
-	// and under TUN every host socket has the same source address. Records
-	// keyed by the destination too tell them apart; a loader or observer
-	// without them leaves only the source, so a Wine record can belong to
-	// another socket on the port, such as a pasta relay's. The socket's owner
-	// is looked up first, before sockOwners.mu is held, since lookup takes
-	// that lock itself.
-	owner, ownerKnown := sockOwnerOf(key, peers)
 	sockOwners.mu.RLock()
 	defer sockOwners.mu.RUnlock()
 	dir, enabled := wineFlowsDir(sockOwners.path)
@@ -227,11 +224,6 @@ func findWineProcess(network string, ip netip.Addr, srcPort int, peers []netip.A
 	noteWineHealth(dir)
 	value, live, found := wineFlowMaps.lookup(&key, peers, dir)
 	if !found {
-		return "", "", false
-	}
-	if ownerKnown && !wineRecordCovers(&value, owner.Tgid) {
-		log.Debugln("[Process] Ignoring Wine record of TGID %d for %s %s:%d owned by TGID %d",
-			value.ServerTgid, network, ip, srcPort, owner.Tgid)
 		return "", "", false
 	}
 	if !live {
@@ -248,14 +240,6 @@ func findWineProcess(network string, ip netip.Addr, srcPort int, peers []netip.A
 	}
 	lookupCounters.wineKnown.Add(1)
 	return name, path, true
-}
-
-// wineRecordCovers reports whether a Wine record can describe a socket owned
-// by tgid. A record names the process which relays or serves the socket and,
-// for sockets a Windows program opened or uses itself, that client. A socket
-// owned by neither is another socket on the same port, not a Wine flow.
-func wineRecordCovers(value *wineFlowValue, tgid uint32) bool {
-	return tgid == value.ServerTgid || value.ClientTgid != 0 && tgid == value.ClientTgid
 }
 
 // wineImage decodes the image as socketowner does: an absolute UTF-16 Windows

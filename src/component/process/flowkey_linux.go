@@ -95,18 +95,3 @@ func (m *sockOwnerMap) lookupFlowLocked(key sockOwnerKey, peers []netip.AddrPort
 	}
 	return value, false
 }
-
-// sockOwnerOf returns the recorded owner of a connection without counting the
-// lookup, preferring the record of its exact flow. It takes sockOwners.mu.
-func sockOwnerOf(key sockOwnerKey, peers []netip.AddrPort) (sockOwnerValue, bool) {
-	var owner sockOwnerValue
-	found := sockOwners.lookup(func(fd int, netns uint64) bool {
-		key.Netns = netns
-		if flow, ok := sockOwners.lookupFlowLocked(key, peers); ok {
-			owner = flow.owner()
-			return true
-		}
-		return lookupBPFMap(fd, &key, &owner)
-	})
-	return owner, found && owner.Tgid != 0
-}

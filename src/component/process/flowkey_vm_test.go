@@ -14,8 +14,8 @@ import (
 )
 
 // Pinned maps as a loader with conn_flows and an observer with
-// wine_peer_flows publish them: a record of the exact flow is preferred, and
-// a source-only Wine record of another owner is not taken for the flow's.
+// wine_peer_flows publish them: the record of the exact flow is preferred,
+// and the source-keyed records answer when there is none.
 func TestFlowRecordsPreferred(t *testing.T) {
 	dir := fmt.Sprintf("/sys/fs/bpf/mihomo-flow-test-%d", os.Getpid())
 	if err := os.Mkdir(dir, 0700); err != nil {
@@ -80,8 +80,10 @@ func TestFlowRecordsPreferred(t *testing.T) {
 	k := flowKey(librewolf)
 	put(flows, unsafe.Pointer(&k), unsafe.Pointer(&browser))
 	alpha, beta := wineValue(`C:\Games\alpha.exe`), wineValue(`C:\Games\beta.exe`)
+	// A relayed socket belongs to pasta, but its record names the sandbox's
+	// wineserver and the Windows program, as the inner socket's does.
 	for _, v := range []*wineFlowValue{alpha, beta} {
-		v.Status, v.Protocol, v.ServerTgid = wineStatusKnown, unix.IPPROTO_TCP, relayOwner.Tgid
+		v.Status, v.Protocol, v.ServerTgid, v.ClientTgid = wineStatusKnown, unix.IPPROTO_TCP, 333, 334
 	}
 	put(wineFlowsFd, unsafe.Pointer(&key), unsafe.Pointer(alpha))
 	k = flowKey(pasta)
@@ -100,9 +102,10 @@ func TestFlowRecordsPreferred(t *testing.T) {
 		tgid  uint32
 		wine  string
 	}{
-		// The browser's own flow: its record, and the relay's Wine record
-		// on the same port is someone else's.
-		{"exact browser flow", []netip.AddrPort{librewolf}, 222, ""},
+		// The browser's own flow has its own owner record. With no Wine
+		// record for its destination, the source-keyed one still answers:
+		// that is the fallback's limit.
+		{"exact browser flow", []netip.AddrPort{librewolf}, 222, `C:\Games\alpha.exe`},
 		// The relay's flow has its own Wine record.
 		{"exact relay flow", []netip.AddrPort{pasta}, 111, `C:\Games\beta.exe`},
 		// Without a destination, the source-only records apply.
