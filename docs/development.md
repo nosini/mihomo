@@ -103,3 +103,22 @@ metadata those outbounds record is
 and `src/rules/common/flatpak_app.go`. `SYSTEMD-UNIT` rules and the
 `systemdUnit` metadata field are `patches/0006-systemd-unit-rule.patch` with
 `src/rules/common/systemd_unit.go`; they reuse that cgroup lookup.
+
+## Releases
+
+The openSUSE packages in
+[home:Nosini:proxy](https://build.opensuse.org/project/show/home:Nosini:proxy) build
+release tags. A tag is named `vUPSTREAM-N`: the upstream release the pinned submodule
+builds on, and the fork's release number on it, starting at 1 for each upstream
+release. `v1.19.34-1` becomes package version `1.19.34.1`. Other `v*` tags, such as
+the upstream tags in this repository's history, are not releases. Tag a commit on
+`main` and push the tag:
+
+```sh
+git tag -s v1.19.34-2 -m 'mihomo 1.19.34-2'
+git push github v1.19.34-2
+```
+
+`.github/workflows/obs.yml` then sets the tag as the revision of the package's
+`_service` on src.opensuse.org, which OBS builds. It needs the `OBS_GIT_TOKEN` secret,
+a src.opensuse.org access token that can write to `Nosini/mihomo`.
