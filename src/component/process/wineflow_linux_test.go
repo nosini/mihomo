@@ -89,3 +89,17 @@ func TestWineFlowsDir(t *testing.T) {
 		}{dir, enabled}, owner)
 	}
 }
+
+// A socket sharing an ephemeral port with a relayed Wine flow, as host sockets
+// do under TUN, must not take that flow's Windows identity.
+func TestWineRecordCovers(t *testing.T) {
+	relayed := &wineFlowValue{ServerTgid: 400}
+	assert.True(t, wineRecordCovers(relayed, 400), "the pasta relay itself")
+	assert.False(t, wineRecordCovers(relayed, 500), "another process on the port")
+	assert.False(t, wineRecordCovers(relayed, 0), "no client recorded")
+
+	served := &wineFlowValue{ServerTgid: 100, ClientTgid: 200}
+	assert.True(t, wineRecordCovers(served, 100), "wineserver")
+	assert.True(t, wineRecordCovers(served, 200), "the Windows program's own process")
+	assert.False(t, wineRecordCovers(served, 300), "an unrelated process")
+}

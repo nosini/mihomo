@@ -114,7 +114,7 @@ type lookupResult struct {
 
 func lookupBPF(network string, ap netip.AddrPort) lookupResult {
 	start := time.Now()
-	owner, ok := lookupSockOwner(network, ap.Addr(), int(ap.Port()))
+	owner, ok := lookupSockOwner(network, ap.Addr(), int(ap.Port()), nil)
 	if !ok {
 		return lookupResult{err: ErrNotFound, took: time.Since(start)}
 	}
@@ -555,7 +555,7 @@ func TestSockOwnerRestoresEvicted(t *testing.T) {
 		if err := mapElem(unix.BPF_MAP_DELETE_ELEM, mapFd, unsafe.Pointer(&key), nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := lookupSockOwner("udp", src.Addr(), int(src.Port())); ok {
+		if _, ok := lookupSockOwner("udp", src.Addr(), int(src.Port()), nil); ok {
 			t.Fatal("entry still there after deleting it")
 		}
 		io.WriteString(stdin, "\n")

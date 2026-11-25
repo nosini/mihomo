@@ -81,7 +81,7 @@ func TestCgroupPathDecode(t *testing.T) {
 // A loader that predates conn_cgroups doesn't advertise it; the map is not
 // opened and the reason is kept for the health snapshot.
 func TestCgroupMapNeedsFeature(t *testing.T) {
-	m := &sockOwnerMap{path: filepath.Join(t.TempDir(), "conn_owners"), fd: -1, tasksFd: -1, recentFd: -1, cgroupsFd: -1}
+	m := &sockOwnerMap{path: filepath.Join(t.TempDir(), "conn_owners"), fd: -1, tasksFd: -1, recentFd: -1, cgroupsFd: -1, flowsFd: -1}
 	m.openCgroupMapLocked()
 	if m.cgroupsFd >= 0 || !strings.Contains(m.cgroupErr, "update") {
 		t.Fatalf("fd %d, error %q", m.cgroupsFd, m.cgroupErr)

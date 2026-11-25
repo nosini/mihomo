@@ -1,0 +1,112 @@
+diff --git a/component/process/process.go b/component/process/process.go
+index 18a8003..8d08a73 100644
+--- a/component/process/process.go
++++ b/component/process/process.go
+@@ -22,15 +22,19 @@ const (
+ // pins the map used on Linux. See docs/socketowner.md.
+ const DefaultSockOwnerMap = "/sys/fs/bpf/mihomo/maps/conn_owners"
+ 
+-func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, string, error) {
+-	return findProcessName(network, srcIP, srcPort)
++// FindProcessName returns the UID and executable of the process owning a
++// connection. peers are the destinations its outgoing packets may carry; on
++// Linux they tell apart sockets sharing a source port, which connect()
++// allows for different destinations.
++func FindProcessName(network string, srcIP netip.Addr, srcPort int, peers ...netip.AddrPort) (uint32, string, error) {
++	return findProcessNameTo(network, srcIP, srcPort, peers)
+ }
+ 
+ // FindWineProcess returns the name and Windows path of the program behind a
+ // connection relayed for Wine, or WineUnknown for both. FindProcessName still
+ // names the socket's own process.
+-func FindWineProcess(network string, srcIP netip.Addr, srcPort int) (name, path string, ok bool) {
+-	return findWineProcess(network, srcIP, srcPort)
++func FindWineProcess(network string, srcIP netip.Addr, srcPort int, peers ...netip.AddrPort) (name, path string, ok bool) {
++	return findWineProcess(network, srcIP, srcPort, peers)
+ }
+ 
+ // PackageNameResolver
+diff --git a/component/process/process_linux.go b/component/process/process_linux.go
+index 44ad93a..c1adff5 100644
+--- a/component/process/process_linux.go
++++ b/component/process/process_linux.go
+@@ -63,7 +63,11 @@ type inetDiagResponse struct {
+ }
+ 
+ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
+-	if owner, ok := lookupSockOwner(network, ip, srcPort); ok {
++	return findProcessNameTo(network, ip, srcPort, nil)
++}
++
++func findProcessNameTo(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (uint32, string, error) {
++	if owner, ok := lookupSockOwner(network, ip, srcPort, peers); ok {
+ 		path, err := resolveSockOwnerPath(owner)
+ 		if err == nil {
+ 			return owner.UID, path, nil
+diff --git a/constant/metadata.go b/constant/metadata.go
+index de55b11..075670d 100644
+--- a/constant/metadata.go
++++ b/constant/metadata.go
+@@ -219,6 +219,11 @@ type Metadata struct {
+ 	// Only domain rule
+ 	SniffHost string `json:"sniffHost"`
+ 
++	// The destination of the connection's packets as they reached mihomo,
++	// before fake-ip, sniffing or rules change DstIP and DstPort. Process
++	// lookup tells apart sockets sharing a source port by it.
++	PacketDst netip.AddrPort `json:"-"`
++
+ 	// The Windows program behind a Wine connection, beside the process owning its socket
+ 	WineProcess     string `json:"wineProcess,omitempty"`
+ 	WineProcessPath string `json:"wineProcessPath,omitempty"`
+@@ -330,6 +335,13 @@ func (m *Metadata) Pure() *Metadata {
+ 	return m
+ }
+ 
++// FlowPeers returns the destinations the connection's outgoing packets may
++// have carried when they left their socket: the packet destination, or the
++// inbound's own address when netfilter redirected them to it.
++func (m *Metadata) FlowPeers() []netip.AddrPort {
++	return []netip.AddrPort{m.PacketDst, netip.AddrPortFrom(m.InIP.Unmap(), m.InPort)}
++}
++
+ func (m *Metadata) Clone() *Metadata {
+ 	copyM := *m
+ 	return &copyM
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 73b4d1e..689edd7 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -287,6 +287,9 @@ func fixMetadata(metadata *C.Metadata) {
+ 		metadata.DstIP = ip.Unmap()
+ 		metadata.Host = ""
+ 	}
++	if !metadata.PacketDst.IsValid() && metadata.DstIP.IsValid() {
++		metadata.PacketDst = netip.AddrPortFrom(metadata.DstIP, metadata.DstPort)
++	}
+ }
+ 
+ func needLookupIP(metadata *C.Metadata) bool {
+@@ -360,7 +363,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 				attemptProcessLookup = false
+ 				if !features.CMFA {
+ 					// normal check for process
+-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
++					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort), metadata.FlowPeers()...)
+ 					if err != nil {
+ 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+ 						if uid != 0 {
+@@ -378,11 +381,11 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 						}
+ 					}
+ 					// A Wine program is known even when its relay's owner isn't.
+-					if name, path, ok := process.FindWineProcess(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort)); ok {
++					if name, path, ok := process.FindWineProcess(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort), metadata.FlowPeers()...); ok {
+ 						metadata.WineProcess = name
+ 						metadata.WineProcessPath = path
+ 					}
+-					if path, ok := process.FindCgroup(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort)); ok {
++					if path, ok := process.FindCgroup(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort), metadata.FlowPeers()...); ok {
+ 						metadata.CgroupPath = path
+ 						metadata.FlatpakApp, _ = process.FlatpakAppFromCgroupPath(path)
+ 						metadata.SystemdUnit, _ = process.SystemdUnitFromCgroupPath(path)

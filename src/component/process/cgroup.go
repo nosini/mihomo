@@ -10,9 +10,10 @@ import (
 // FindCgroup returns the cgroup v2 path, relative to the cgroupfs root, of
 // the process that owns a connection, as recorded by socketowner. ok is false
 // when the owner or its cgroup is unknown, including a cgroup that was removed
-// before the lookup. See docs/socketowner.md.
-func FindCgroup(network string, srcIP netip.Addr, srcPort int) (path string, ok bool) {
-	return findCgroup(network, srcIP, srcPort)
+// before the lookup. peers are the destinations the connection's outgoing
+// packets may carry, as for FindProcessName. See docs/socketowner.md.
+func FindCgroup(network string, srcIP netip.Addr, srcPort int, peers ...netip.AddrPort) (path string, ok bool) {
+	return findCgroup(network, srcIP, srcPort, peers)
 }
 
 // cgroupLookupWanted is set once a rule needs cgroups, so that a loader

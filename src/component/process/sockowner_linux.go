@@ -169,8 +169,10 @@ type sockOwnerMap struct {
 	recentFd int
 	// cgroupsFd is conn_cgroups and pathsFd cgroup_paths, each open while
 	// the loader advertises it.
-	cgroupsFd  int
-	pathsFd    int
+	cgroupsFd int
+	pathsFd   int
+	// flowsFd is conn_flows, open while the loader advertises it.
+	flowsFd    int
 	features   uint32
 	netns      uint64
 	pinned     pinnedMapSet
@@ -185,7 +187,7 @@ type sockOwnerMap struct {
 	cgroupWarned bool
 }
 
-var sockOwners = &sockOwnerMap{path: DefaultSockOwnerMap, fd: -1, tasksFd: -1, recentFd: -1, cgroupsFd: -1, pathsFd: -1}
+var sockOwners = &sockOwnerMap{path: DefaultSockOwnerMap, fd: -1, tasksFd: -1, recentFd: -1, cgroupsFd: -1, pathsFd: -1, flowsFd: -1}
 
 // SetSockOwnerMap sets the pinned socket-owner map to use; an empty path
 // turns the lookup off.
@@ -230,7 +232,7 @@ func SockOwnerOnly() bool {
 
 func (m *sockOwnerMap) closeLocked() {
 	m.features = 0
-	for _, fd := range []*int{&m.fd, &m.tasksFd, &m.recentFd, &m.cgroupsFd, &m.pathsFd} {
+	for _, fd := range []*int{&m.fd, &m.tasksFd, &m.recentFd, &m.cgroupsFd, &m.pathsFd, &m.flowsFd} {
 		if *fd >= 0 {
 			unix.Close(*fd)
 			*fd = -1
@@ -291,6 +293,9 @@ func (m *sockOwnerMap) refreshLocked() bool {
 	}
 	if m.cgroupsFd < 0 {
 		m.openCgroupMapLocked()
+	}
+	if m.flowsFd < 0 {
+		m.openFlowMapLocked()
 	}
 	if !changed && m.tasksFd >= 0 {
 		return changed
@@ -483,7 +488,10 @@ func currentNetnsCookie() (uint64, error) {
 	return cookie, nil
 }
 
-func lookupSockOwner(network string, ip netip.Addr, srcPort int) (sockOwnerValue, bool) {
+// lookupSockOwner returns the recorded owner of a connection. peers are the
+// destinations its outgoing packets may carry; the record of the exact flow
+// is preferred, since sockets with different peers can share a source port.
+func lookupSockOwner(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (sockOwnerValue, bool) {
 	key, ok := newSockOwnerKey(network, ip, srcPort)
 	if !ok {
 		return sockOwnerValue{}, false
@@ -495,6 +503,10 @@ func lookupSockOwner(network string, ip netip.Addr, srcPort int) (sockOwnerValue
 	found := sockOwners.lookup(func(fd int, netns uint64) bool {
 		consulted = true
 		key.Netns = netns
+		if flow, ok := sockOwners.lookupFlowLocked(key, peers); ok {
+			value = flow.owner()
+			return true
+		}
 		return lookupBPFMap(fd, &key, &value)
 	})
 	if found && value.Tgid != 0 {

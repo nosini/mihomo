@@ -27,11 +27,14 @@ const WineUnknown = "wine-unknown"
 // pinned beside conn_owners with their own version.
 const (
 	wineFlowsMap     = "wine_flows"
+	winePeerFlowsMap = "wine_peer_flows"
 	wineABIMap       = "wine_abi"
 	wineHeartbeatMap = "wine_heartbeat"
 	wineABIVersion   = uint32(2)
 	wineImageBytes   = 1024
 	wineStatusKnown  = 1
+	// wine_abi key 1: wine_peer_flows keys records by destination too.
+	wineFeaturePeerFlows = 1 << 0
 	// The publisher writes its heartbeat every second.
 	wineHeartbeatLimit = 5 * time.Second
 )
@@ -60,6 +63,7 @@ type wineFlowValue struct {
 type wineFlows struct {
 	mu            sync.RWMutex
 	flowsFd       int
+	peerFlowsFd   int
 	heartbeatFd   int
 	netns         uint64
 	pinned        pinnedMapSet
@@ -67,10 +71,10 @@ type wineFlows struct {
 	healthChecked atomic.Int64
 }
 
-var wineFlowMaps = &wineFlows{flowsFd: -1, heartbeatFd: -1}
+var wineFlowMaps = &wineFlows{flowsFd: -1, peerFlowsFd: -1, heartbeatFd: -1}
 
 func (w *wineFlows) closeLocked() {
-	for _, fd := range []*int{&w.flowsFd, &w.heartbeatFd} {
+	for _, fd := range []*int{&w.flowsFd, &w.peerFlowsFd, &w.heartbeatFd} {
 		if *fd >= 0 {
 			unix.Close(*fd)
 			*fd = -1
@@ -89,7 +93,8 @@ func (w *wineFlows) reset() {
 }
 
 func (w *wineFlows) openLocked(dir string) error {
-	if _, err := checkABI(filepath.Join(dir, wineABIMap), wineABIVersion); err != nil {
+	features, err := checkABI(filepath.Join(dir, wineABIMap), wineABIVersion)
+	if err != nil {
 		return fmt.Errorf("Wine ABI: %w", err)
 	}
 	netns, err := currentNetnsCookie()
@@ -106,7 +111,17 @@ func (w *wineFlows) openLocked(dir string) error {
 		unix.Close(heartbeat)
 		return err
 	}
-	w.flowsFd, w.heartbeatFd, w.netns = flows, heartbeat, netns
+	peerFlows := -1
+	if features&wineFeaturePeerFlows != 0 {
+		peerFlows, err = openBPFMap(filepath.Join(dir, winePeerFlowsMap), unix.BPF_MAP_TYPE_LRU_HASH,
+			uint32(unsafe.Sizeof(sockFlowKey{})), wineFlowValue{})
+		if err != nil {
+			unix.Close(flows)
+			unix.Close(heartbeat)
+			return err
+		}
+	}
+	w.flowsFd, w.peerFlowsFd, w.heartbeatFd, w.netns = flows, peerFlows, heartbeat, netns
 	return nil
 }
 
@@ -132,10 +147,11 @@ func (w *wineFlows) heartbeatAgeLocked() (time.Duration, bool) {
 	return time.Duration(now.Nano() - int64(beat)), true
 }
 
-// lookup returns the record of a flow, given its key without the namespace.
-// live is false if its publisher stopped beating, which leaves records
-// unmaintained: a port may have changed hands.
-func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, live, found bool) {
+// lookup returns the record of a flow, given its key without the namespace,
+// preferring the record of its exact flow to one of peers. live is false if
+// its publisher stopped beating, which leaves records unmaintained: a port
+// may have changed hands.
+func (w *wineFlows) lookup(key *sockOwnerKey, peers []netip.AddrPort, dir string) (value wineFlowValue, live, found bool) {
 	w.mu.RLock()
 	stale := w.pinned.stale()
 	w.mu.RUnlock()
@@ -152,7 +168,15 @@ func (w *wineFlows) lookup(key *sockOwnerKey, dir string) (value wineFlowValue, 
 		return value, false, false
 	}
 	key.Netns = w.netns
-	if !lookupBPFMap(w.flowsFd, key, &value) {
+	found = false
+	if w.peerFlowsFd >= 0 {
+		for _, k := range flowKeys(*key, peers) {
+			if found = lookupBPFMap(w.peerFlowsFd, &k, &value); found {
+				break
+			}
+		}
+	}
+	if !found && !lookupBPFMap(w.flowsFd, key, &value) {
 		return value, false, false
 	}
 	// The publisher writes host CLOCK_BOOTTIME; a beat from the future means
@@ -175,13 +199,23 @@ func wineFlowsDir(ownerPath string) (string, bool) {
 
 // findWineProcess names the Windows program behind a flow, which is reported
 // beside the process owning the socket, such as a sandbox's relay. ok is false
-// when no Wine record covers it. An unusable record gives WineUnknown, so that
-// a rule for a Windows program is never passed for lack of its identity.
-func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path string, ok bool) {
+// when no Wine record covers it, including when the socket's recorded owner is
+// neither the record's server nor its client. An unusable record gives
+// WineUnknown, so that a rule for a Windows program is never passed for lack
+// of its identity.
+func findWineProcess(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (name, path string, ok bool) {
 	key, ok := newSockOwnerKey(network, ip, srcPort)
 	if !ok {
 		return "", "", false
 	}
+	// connect() lets sockets with different peers share an ephemeral port,
+	// and under TUN every host socket has the same source address. Records
+	// keyed by the destination too tell them apart; a loader or observer
+	// without them leaves only the source, so a Wine record can belong to
+	// another socket on the port, such as a pasta relay's. The socket's owner
+	// is looked up first, before sockOwners.mu is held, since lookup takes
+	// that lock itself.
+	owner, ownerKnown := sockOwnerOf(key, peers)
 	sockOwners.mu.RLock()
 	defer sockOwners.mu.RUnlock()
 	dir, enabled := wineFlowsDir(sockOwners.path)
@@ -191,8 +225,13 @@ func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path str
 	// Sample the publication state while looking flows up, so a stopped
 	// publisher is noticed even without the /process-lookup route.
 	noteWineHealth(dir)
-	value, live, found := wineFlowMaps.lookup(&key, dir)
+	value, live, found := wineFlowMaps.lookup(&key, peers, dir)
 	if !found {
+		return "", "", false
+	}
+	if ownerKnown && !wineRecordCovers(&value, owner.Tgid) {
+		log.Debugln("[Process] Ignoring Wine record of TGID %d for %s %s:%d owned by TGID %d",
+			value.ServerTgid, network, ip, srcPort, owner.Tgid)
 		return "", "", false
 	}
 	if !live {
@@ -209,6 +248,14 @@ func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path str
 	}
 	lookupCounters.wineKnown.Add(1)
 	return name, path, true
+}
+
+// wineRecordCovers reports whether a Wine record can describe a socket owned
+// by tgid. A record names the process which relays or serves the socket and,
+// for sockets a Windows program opened or uses itself, that client. A socket
+// owned by neither is another socket on the same port, not a Wine flow.
+func wineRecordCovers(value *wineFlowValue, tgid uint32) bool {
+	return tgid == value.ServerTgid || value.ClientTgid != 0 && tgid == value.ClientTgid
 }
 
 // wineImage decodes the image as socketowner does: an absolute UTF-16 Windows

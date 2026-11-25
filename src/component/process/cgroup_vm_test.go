@@ -200,7 +200,7 @@ func TestCgroupFlatpakScope(t *testing.T) {
 	if !recorded && (path != "" || app != "") {
 		t.Fatalf("removed scope: cgroup %q, app %q", path, app)
 	}
-	if _, ok := lookupSockCgroup("tcp", src.Addr(), int(src.Port())); !ok {
+	if _, ok := lookupSockCgroup("tcp", src.Addr(), int(src.Port()), nil); !ok {
 		t.Fatal("the cgroup ID itself should still be recorded")
 	}
 }

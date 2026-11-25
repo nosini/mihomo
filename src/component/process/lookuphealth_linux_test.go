@@ -123,7 +123,7 @@ func TestLookupHealth(t *testing.T) {
 		recentFd: 5,
 		pinned:   ownerPin,
 	}
-	wine := &wineFlows{flowsFd: -1, heartbeatFd: -1, pinned: winePin}
+	wine := &wineFlows{flowsFd: -1, peerFlowsFd: -1, heartbeatFd: -1, pinned: winePin}
 	swapLookups(t, owners, wine)
 	resetLookupCounters(t)
 	lookupCounters.bpfHits.Add(21)
@@ -160,11 +160,12 @@ func TestLookupHealthClosedMaps(t *testing.T) {
 		fd:       -1,
 		tasksFd:  -1,
 		recentFd: -1,
+		flowsFd:  -1,
 		pinned:   ownerPin,
 		openErr:  "socketowner ABI (install a compatible socketowner loader): unsupported ABI v2 in /run/mihomo-bpf/abi_version (need v1)",
 		execErr:  "open /run/mihomo-bpf/exec_tasks: no such file or directory",
 	}
-	wine := &wineFlows{flowsFd: -1, heartbeatFd: -1, pinned: winePin}
+	wine := &wineFlows{flowsFd: -1, peerFlowsFd: -1, heartbeatFd: -1, pinned: winePin}
 	swapLookups(t, owners, wine)
 
 	h := LookupHealth()
@@ -181,8 +182,8 @@ func TestLookupHealthClosedMaps(t *testing.T) {
 
 func TestLookupHealthDisabled(t *testing.T) {
 	ownerPin, _ := freshPins(time.Now())
-	owners := &sockOwnerMap{path: "", fd: -1, tasksFd: -1, recentFd: -1, pinned: ownerPin}
-	swapLookups(t, owners, &wineFlows{flowsFd: -1, heartbeatFd: -1})
+	owners := &sockOwnerMap{path: "", fd: -1, tasksFd: -1, recentFd: -1, flowsFd: -1, pinned: ownerPin}
+	swapLookups(t, owners, &wineFlows{flowsFd: -1, peerFlowsFd: -1, heartbeatFd: -1})
 
 	h := LookupHealth()
 	if h.MapPath != "" || h.Maps.Open || h.Maps.Error != "" || h.Wine.Present {
@@ -204,12 +205,13 @@ func TestLookupSockOwnerCountsMiss(t *testing.T) {
 		fd:       fd,
 		tasksFd:  -1,
 		recentFd: -1,
+		flowsFd:  -1,
 		netns:    1,
 		pinned:   ownerPin,
 	}, wineFlowMaps)
 	resetLookupCounters(t)
 
-	if _, ok := lookupSockOwner("tcp", netip.MustParseAddr("127.0.0.1"), 4242); ok {
+	if _, ok := lookupSockOwner("tcp", netip.MustParseAddr("127.0.0.1"), 4242, nil); ok {
 		t.Fatal("an ordinary socket named an owner")
 	}
 	if hits, misses := lookupCounters.bpfHits.Load(), lookupCounters.bpfMisses.Load(); hits != 0 || misses != 1 {
@@ -219,7 +221,7 @@ func TestLookupSockOwnerCountsMiss(t *testing.T) {
 
 func TestNoteWineHealth(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "conn_owners")
-	wine := &wineFlows{flowsFd: -1, heartbeatFd: -1}
+	wine := &wineFlows{flowsFd: -1, peerFlowsFd: -1, heartbeatFd: -1}
 	previous := wineFlowMaps
 	wineFlowMaps = wine
 	t.Cleanup(func() { wineFlowMaps = previous })

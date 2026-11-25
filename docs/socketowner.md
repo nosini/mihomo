@@ -68,6 +68,20 @@ not depend on the loader's Go module or cilium/ebpf.
 Loader releases and mihomo releases need not have matching version
 numbers; their supported map ABI must match.
 
+## Sockets sharing a source port
+
+Linux lets sockets with different destinations share a local address and port,
+and with TUN every local socket has the same source address. A map keyed by the
+source alone then holds whichever of those sockets sent last. Loaders that
+publish `conn_flows` (feature bit 2 of `abi_version`) also key each owner by the
+packet's destination, and the Wine observer's `wine_peer_flows` does the same
+for Windows programs. mihomo looks up the destination of a connection's packets
+as they reached it, before fake-ip or the sniffer change it, and the inbound's
+own address, which is the destination a redirected packet carries. When neither
+has a record, it uses the source-only maps. A Wine record from those is ignored
+if the socket's owner is known and is neither its wineserver nor its client, so
+another process on the same port never takes a Windows program's identity.
+
 ## Flatpak apps
 
 Loaders that publish owner cgroups (feature bit 0 of `abi_version`, the

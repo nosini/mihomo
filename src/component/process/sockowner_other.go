@@ -23,11 +23,17 @@ func SetSockOwnerOnly(only bool) { sockOwnerOnly = only }
 func SockOwnerOnly() bool { return sockOwnerOnly }
 
 // Wine programs are identified only on Linux.
-func findWineProcess(network string, ip netip.Addr, srcPort int) (name, path string, ok bool) {
+func findWineProcess(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (name, path string, ok bool) {
 	return "", "", false
 }
 
+// Only Linux has the socket-owner maps; elsewhere the destination adds
+// nothing to the lookup.
+func findProcessNameTo(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (uint32, string, error) {
+	return findProcessName(network, ip, srcPort)
+}
+
 // Cgroups are attributed only on Linux.
-func findCgroup(network string, ip netip.Addr, srcPort int) (string, bool) {
+func findCgroup(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (string, bool) {
 	return "", false
 }

@@ -52,7 +52,7 @@ func TestWineFlowStalePublisher(t *testing.T) {
 	defer SetSockOwnerMap(previous)
 	// The global optional reader keeps FDs between calls; restore it too.
 	previousWine := wineFlowMaps
-	wineFlowMaps = &wineFlows{flowsFd: -1, heartbeatFd: -1}
+	wineFlowMaps = &wineFlows{flowsFd: -1, peerFlowsFd: -1, heartbeatFd: -1}
 	defer func() { wineFlowMaps.closeLocked(); wineFlowMaps = previousWine }()
 	key := ownerKey(t, "tcp", netip.MustParseAddrPort("127.0.0.1:4255"))
 	value := wineValue(`C:\Games\alpha.exe`)
@@ -66,7 +66,7 @@ func TestWineFlowStalePublisher(t *testing.T) {
 	put(heartbeat, unsafe.Pointer(&slot), unsafe.Pointer(&beat))
 	check := func(want string, covered bool) {
 		t.Helper()
-		_, path, ok := findWineProcess("tcp", netip.MustParseAddr("127.0.0.1"), 4255)
+		_, path, ok := findWineProcess("tcp", netip.MustParseAddr("127.0.0.1"), 4255, nil)
 		if path != want || ok != covered {
 			t.Fatalf("got path=%q covered=%v; want %q covered=%v", path, ok, want, covered)
 		}

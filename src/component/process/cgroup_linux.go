@@ -119,8 +119,9 @@ func (m *sockOwnerMap) noteCgroupUnavailable() {
 	log.Warnln("[Process] Can't attribute connections to cgroups, so FLATPAK-APP and SYSTEMD-UNIT rules match nothing: %s", m.cgroupErr)
 }
 
-// lookupSockCgroup returns the cgroup ID recorded for a connection's owner.
-func lookupSockCgroup(network string, ip netip.Addr, srcPort int) (uint64, bool) {
+// lookupSockCgroup returns the cgroup ID recorded for a connection's owner,
+// from the record of its exact flow where there is one.
+func lookupSockCgroup(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (uint64, bool) {
 	key, ok := newSockOwnerKey(network, ip, srcPort)
 	if !ok {
 		return 0, false
@@ -132,6 +133,11 @@ func lookupSockCgroup(network string, ip netip.Addr, srcPort int) (uint64, bool)
 	// fn runs with m.mu held for reading.
 	found := m.lookup(func(fd int, netns uint64) bool {
 		key.Netns = netns
+		// A flow record holds its owner's cgroup, written with it.
+		if flow, ok := m.lookupFlowLocked(key, peers); ok {
+			cg.CgroupID = flow.CgroupID
+			return flow.Tgid != 0 && flow.CgroupID != 0
+		}
 		if !lookupBPFMap(fd, &key, &owner) || owner.Tgid == 0 {
 			return false
 		}
@@ -150,8 +156,8 @@ func lookupSockCgroup(network string, ip netip.Addr, srcPort int) (uint64, bool)
 	return cg.CgroupID, true
 }
 
-func findCgroup(network string, ip netip.Addr, srcPort int) (string, bool) {
-	id, ok := lookupSockCgroup(network, ip, srcPort)
+func findCgroup(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (string, bool) {
+	id, ok := lookupSockCgroup(network, ip, srcPort, peers)
 	if !ok {
 		lookupCounters.cgroupUnknown.Add(1)
 		return "", false
