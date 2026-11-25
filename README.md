@@ -19,7 +19,29 @@ This build of [Mihomo](https://github.com/MetaCubeX/mihomo) adds:
 Connection statistics and TLS hostname discovery stay on their own branches and
 are not part of `main`.
 
-## Build and install
+## Install on openSUSE Tumbleweed
+
+The [home:Nosini:proxy](https://build.opensuse.org/project/show/home:Nosini:proxy)
+repository on the openSUSE Build Service builds this mihomo from `main`, together
+with socketowner and hardened-proxy-service. Add it with a higher priority than the
+distribution's repositories, since its `mihomo` replaces openSUSE's:
+
+```sh
+sudo zypper ar -p 90 -f https://download.opensuse.org/repositories/home:/Nosini:/proxy/openSUSE_Tumbleweed/ nosini-proxy
+sudo zypper ref nosini-proxy
+sudo zypper in mihomo
+```
+
+The `mihomo` package installs only the executable, `/usr/bin/mihomo`, without a
+service or configuration. It is built without the EasyTier outbound, whose core
+upstream ships prebuilt. For the sandboxed service with its kill switch and
+process lookup, install `hardened-proxy-service` instead, which pulls in `mihomo`
+and recommends `socketowner`; add `hardened-proxy-service-wine-observer` for Wine
+names. None of its services are enabled on installation; its
+[README](https://github.com/nosini/hardened-proxy-service) covers the
+configuration and enabling them.
+
+## Build from source
 
 Install Git, Python 3, make and a Go toolchain supported by the pinned upstream
 source. The current source has been built and tested with Go 1.27.3.
