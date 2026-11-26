@@ -26,6 +26,9 @@ func TestFlowKeys(t *testing.T) {
 	peer := netip.MustParseAddrPort("[::ffff:198.18.0.5]:443")
 	keys := flowKeys(key, []netip.AddrPort{
 		{}, // no packet destination
+		netip.MustParseAddrPort("0.0.0.0:7891"),
+		netip.MustParseAddrPort("[::]:7891"),
+		netip.MustParseAddrPort("[::ffff:0.0.0.0]:7891"),
 		peer,
 		netip.MustParseAddrPort("198.18.0.5:443"),               // the same, unmapped
 		netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0), // no inbound port

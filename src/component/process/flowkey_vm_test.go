@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 	"unsafe"
 
+	C "github.com/metacubex/mihomo/constant"
 	"golang.org/x/sys/unix"
 )
 
@@ -141,5 +143,227 @@ func TestFlowRecordsPreferred(t *testing.T) {
 	}
 	if id, ok := lookupSockCgroup("tcp", source.Addr(), int(source.Port()), []netip.AddrPort{librewolf}); !ok || id != 77 {
 		t.Errorf("cgroup = %d, %v; want the flow record's 77", id, ok)
+	}
+}
+
+// A stale conn_flows record at the proxied or pre-redirect destination must not
+// shadow the live record at the inbound listener for proxy and REDIR inbounds,
+// while TUN and TPROXY still match PacketDst.
+func TestFlowPeersStaleDstDoesNotShadowInbound(t *testing.T) {
+	dir := fmt.Sprintf("/sys/fs/bpf/mihomo-flowpeers-test-%d", os.Getpid())
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	create := func(name string, kind, keySize, valueSize, entries uint32) int {
+		t.Helper()
+		attr := struct{ Type, KeySize, ValueSize, MaxEntries uint32 }{kind, keySize, valueSize, entries}
+		fd, err := bpfCall(unix.BPF_MAP_CREATE, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { unix.Close(int(fd)) })
+		if err := pinObject(int(fd), filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+		return int(fd)
+	}
+	put := func(fd int, key, value unsafe.Pointer) {
+		t.Helper()
+		if err := mapElem(unix.BPF_MAP_UPDATE_ELEM, fd, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	abi := create("abi_version", unix.BPF_MAP_TYPE_ARRAY, 4, 4, 2)
+	create("conn_owners", unix.BPF_MAP_TYPE_LRU_HASH, uint32(unsafe.Sizeof(sockOwnerKey{})), uint32(unsafe.Sizeof(sockOwnerValue{})), 16)
+	flows := create(connFlowsMap, unix.BPF_MAP_TYPE_LRU_HASH, uint32(unsafe.Sizeof(sockFlowKey{})), uint32(unsafe.Sizeof(sockFlowValue{})), 16)
+	for slot, v := range []uint32{1, featureConnFlows} {
+		slot := uint32(slot)
+		put(abi, unsafe.Pointer(&slot), unsafe.Pointer(&v))
+	}
+
+	source := netip.MustParseAddrPort("127.0.0.1:4301")
+	packetDst := netip.MustParseAddrPort("1.1.1.1:443")
+	inbound := netip.MustParseAddrPort("127.0.0.1:7890")
+	key := ownerKey(t, "tcp", source)
+	staleDst := sockFlowValue{Tgid: 111, UID: 1000, BootNs: 1}
+	liveInbound := sockFlowValue{Tgid: 222, UID: 1000, BootNs: 2}
+	kDst := flowKeys(key, []netip.AddrPort{packetDst})[0]
+	kIn := flowKeys(key, []netip.AddrPort{inbound})[0]
+	put(flows, unsafe.Pointer(&kDst), unsafe.Pointer(&staleDst))
+	put(flows, unsafe.Pointer(&kIn), unsafe.Pointer(&liveInbound))
+
+	previous := SockOwnerMap()
+	SetSockOwnerMap(filepath.Join(dir, "conn_owners"))
+	defer SetSockOwnerMap(previous)
+
+	for _, tc := range []struct {
+		name string
+		typ  C.Type
+		want uint32
+	}{
+		{"HTTP", C.HTTP, 222},
+		{"SOCKS5", C.SOCKS5, 222},
+		{"REDIR", C.REDIR, 222},
+		{"TUN", C.TUN, 111},
+		{"TPROXY", C.TPROXY, 111},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &C.Metadata{
+				Type:      tc.typ,
+				PacketDst: packetDst,
+				InIP:      inbound.Addr(),
+				InPort:    inbound.Port(),
+			}
+			owner, ok := lookupSockOwner("tcp", source.Addr(), int(source.Port()), m.FlowPeers())
+			if !ok || owner.Tgid != tc.want {
+				t.Fatalf("owner = %+v, ok=%v; want TGID %d", owner, ok, tc.want)
+			}
+		})
+	}
+}
+
+// Once the pinned conn_owners map is removed or replaced, hits stop serving
+// stale records from the detached map after the recheck interval.
+func TestSockOwnerStopsServingDetachedMap(t *testing.T) {
+	dir := fmt.Sprintf("/sys/fs/bpf/mihomo-detach-test-%d", os.Getpid())
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	create := func(name string, kind, keySize, valueSize, entries uint32) int {
+		t.Helper()
+		attr := struct{ Type, KeySize, ValueSize, MaxEntries uint32 }{kind, keySize, valueSize, entries}
+		fd, err := bpfCall(unix.BPF_MAP_CREATE, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { unix.Close(int(fd)) })
+		if err := pinObject(int(fd), filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+		return int(fd)
+	}
+	abi := create("abi_version", unix.BPF_MAP_TYPE_ARRAY, 4, 4, 2)
+	owners := create("conn_owners", unix.BPF_MAP_TYPE_LRU_HASH, uint32(unsafe.Sizeof(sockOwnerKey{})), uint32(unsafe.Sizeof(sockOwnerValue{})), 16)
+	var slot uint32
+	ver := uint32(1)
+	if err := mapElem(unix.BPF_MAP_UPDATE_ELEM, abi, unsafe.Pointer(&slot), unsafe.Pointer(&ver)); err != nil {
+		t.Fatal(err)
+	}
+	source := netip.MustParseAddrPort("127.0.0.1:4302")
+	key := ownerKey(t, "tcp", source)
+	val := sockOwnerValue{Tgid: 333, UID: 1000, BootNs: 1}
+	if err := mapElem(unix.BPF_MAP_UPDATE_ELEM, owners, unsafe.Pointer(&key), unsafe.Pointer(&val)); err != nil {
+		t.Fatal(err)
+	}
+
+	previous := SockOwnerMap()
+	SetSockOwnerMap(filepath.Join(dir, "conn_owners"))
+	defer SetSockOwnerMap(previous)
+
+	if owner, ok := lookupSockOwner("tcp", source.Addr(), int(source.Port()), nil); !ok || owner.Tgid != 333 {
+		t.Fatalf("before detach: owner = %+v, ok=%v; want TGID 333", owner, ok)
+	}
+	// Replace conn_owners with a new pinned map holding a different owner.
+	if err := os.Remove(filepath.Join(dir, "conn_owners")); err != nil {
+		t.Fatal(err)
+	}
+	owners2 := create("conn_owners", unix.BPF_MAP_TYPE_LRU_HASH, uint32(unsafe.Sizeof(sockOwnerKey{})), uint32(unsafe.Sizeof(sockOwnerValue{})), 16)
+	val2 := sockOwnerValue{Tgid: 444, UID: 1000, BootNs: 2}
+	if err := mapElem(unix.BPF_MAP_UPDATE_ELEM, owners2, unsafe.Pointer(&key), unsafe.Pointer(&val2)); err != nil {
+		t.Fatal(err)
+	}
+	sockOwners.mu.Lock()
+	sockOwners.pinned.checkedAt = time.Now().Add(-sockOwnerRecheck - time.Millisecond)
+	sockOwners.mu.Unlock()
+	if owner, ok := lookupSockOwner("tcp", source.Addr(), int(source.Port()), nil); !ok || owner.Tgid != 444 {
+		t.Fatalf("after replace: owner = %+v, ok=%v; want TGID 444", owner, ok)
+	}
+	// Remove conn_owners completely and verify hits stop serving stale records.
+	if err := os.Remove(filepath.Join(dir, "conn_owners")); err != nil {
+		t.Fatal(err)
+	}
+	sockOwners.mu.Lock()
+	sockOwners.pinned.checkedAt = time.Now().Add(-sockOwnerRecheck - time.Millisecond)
+	sockOwners.mu.Unlock()
+	if owner, ok := lookupSockOwner("tcp", source.Addr(), int(source.Port()), nil); ok {
+		t.Fatalf("after detach: still returned stale owner %+v", owner)
+	}
+}
+
+// An exec-map record whose path failed to record (e.g. -ENAMETOOLONG) preserves
+// the owner's UID and does not fall back to netlink/proc lookup.
+func TestExecPathErrorPreservesUIDWithoutFallback(t *testing.T) {
+	dir := fmt.Sprintf("/sys/fs/bpf/mihomo-execerr-test-%d", os.Getpid())
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	create := func(name string, kind, keySize, valueSize, entries uint32) int {
+		t.Helper()
+		attr := struct{ Type, KeySize, ValueSize, MaxEntries uint32 }{kind, keySize, valueSize, entries}
+		fd, err := bpfCall(unix.BPF_MAP_CREATE, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { unix.Close(int(fd)) })
+		if err := pinObject(int(fd), filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+		return int(fd)
+	}
+	abi := create("abi_version", unix.BPF_MAP_TYPE_ARRAY, 4, 4, 2)
+	owners := create("conn_owners", unix.BPF_MAP_TYPE_LRU_HASH, uint32(unsafe.Sizeof(sockOwnerKey{})), uint32(unsafe.Sizeof(sockOwnerValue{})), 16)
+	recent := create(execRecentMap, unix.BPF_MAP_TYPE_LRU_HASH, 4, uint32(unsafe.Sizeof(execPathValue{})), 16)
+	var slot uint32
+	ver := uint32(1)
+	if err := mapElem(unix.BPF_MAP_UPDATE_ELEM, abi, unsafe.Pointer(&slot), unsafe.Pointer(&ver)); err != nil {
+		t.Fatal(err)
+	}
+
+	source := netip.MustParseAddrPort("127.0.0.1:4303")
+	key := ownerKey(t, "tcp", source)
+	ownerVal := sockOwnerValue{Tgid: 999999, UID: 2345, BootNs: 100}
+	if err := mapElem(unix.BPF_MAP_UPDATE_ELEM, owners, unsafe.Pointer(&key), unsafe.Pointer(&ownerVal)); err != nil {
+		t.Fatal(err)
+	}
+	tgid := uint32(999999)
+	execVal := execPathValue{StartNs: 50, ExitNs: 0, Len: -int32(unix.ENAMETOOLONG)}
+	if err := mapElem(unix.BPF_MAP_UPDATE_ELEM, recent, unsafe.Pointer(&tgid), unsafe.Pointer(&execVal)); err != nil {
+		t.Fatal(err)
+	}
+
+	previous := SockOwnerMap()
+	SetSockOwnerMap(filepath.Join(dir, "conn_owners"))
+	defer SetSockOwnerMap(previous)
+	prevOnly := SockOwnerOnly()
+	SetSockOwnerOnly(false)
+	defer SetSockOwnerOnly(prevOnly)
+
+	// Open conn_owners, then attach exec_recent directly (TASK_STORAGE needs BTF
+	// to create without the loader, and PID 999999 falls through to exec_recent).
+	sockOwners.lookup(func(int, uint64) bool { return false })
+	dupTasks, err := unix.FcntlInt(uintptr(recent), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dupRecent, err := unix.FcntlInt(uintptr(recent), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		unix.Close(dupTasks)
+		t.Fatal(err)
+	}
+	sockOwners.mu.Lock()
+	sockOwners.tasksFd = dupTasks
+	sockOwners.recentFd = dupRecent
+	sockOwners.mu.Unlock()
+
+	beforeFallbacks := lookupCounters.procFallbacks.Load()
+	uid, path, err := findProcessNameTo("tcp", source.Addr(), int(source.Port()), nil)
+	if uid != 2345 || path != "" || err == nil {
+		t.Fatalf("got uid=%d path=%q err=%v; want uid=2345, empty path, error", uid, path, err)
+	}
+	if lookupCounters.procFallbacks.Load() != beforeFallbacks {
+		t.Fatalf("fell back to /proc on -ENAMETOOLONG exec record")
 	}
 }

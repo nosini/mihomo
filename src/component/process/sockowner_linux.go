@@ -20,10 +20,8 @@ import (
 
 const (
 	soNetnsCookie = 71 // SO_NETNS_COOKIE, Linux 5.14
-	// How often to check whether the loader has replaced the map, and how
-	// soon to check again after a lookup misses, which may mean it has.
-	sockOwnerRecheck     = 30 * time.Second
-	sockOwnerMissRecheck = time.Second
+	// How often to check whether the loader has replaced or removed the map.
+	sockOwnerRecheck = time.Second
 	// socketowner's map interface is versioned independently of mihomo.
 	sockOwnerABIVersion uint32 = 1
 )
@@ -74,10 +72,10 @@ func (p *pinnedMapSet) reset(path string) {
 	p.warned = ""
 }
 
-// stale reports whether the pin should be checked again before trusting a
-// miss.
+// stale reports whether the pin should be checked again before trusting
+// open maps or a miss.
 func (p *pinnedMapSet) stale() bool {
-	return time.Since(p.checkedAt) >= sockOwnerMissRecheck
+	return time.Since(p.checkedAt) >= sockOwnerRecheck
 }
 
 // warnOnce reports whether err should be logged. A repeated error stays
@@ -232,6 +230,8 @@ func SockOwnerOnly() bool {
 
 func (m *sockOwnerMap) closeLocked() {
 	m.features = 0
+	m.openErr, m.execErr, m.cgroupErr = "", "", ""
+	m.execWarned, m.cgroupWarned = false, false
 	for _, fd := range []*int{&m.fd, &m.tasksFd, &m.recentFd, &m.cgroupsFd, &m.pathsFd, &m.flowsFd} {
 		if *fd >= 0 {
 			unix.Close(*fd)
@@ -241,27 +241,22 @@ func (m *sockOwnerMap) closeLocked() {
 }
 
 // lookup runs fn with the open map. It opens the map on first use and checks
-// for a new pin periodically and after misses, since the loader may run after
-// mihomo starts or be restarted.
+// for a replaced or removed pin at most once per sockOwnerRecheck, since the
+// loader may run after mihomo starts, be restarted, or detach.
 func (m *sockOwnerMap) lookup(fn func(fd int, netns uint64) bool) bool {
 	m.mu.RLock()
-	age := time.Since(m.pinned.checkedAt)
-	looked := age < sockOwnerRecheck && m.fd >= 0
-	found := looked && fn(m.fd, m.netns)
-	m.mu.RUnlock()
-	if found || age < sockOwnerMissRecheck {
+	if !m.pinned.stale() {
+		found := m.fd >= 0 && fn(m.fd, m.netns)
+		m.mu.RUnlock()
 		return found
 	}
+	m.mu.RUnlock()
 
 	m.mu.Lock()
-	changed := false
 	if m.pinned.stale() {
-		changed = m.refreshLocked()
+		m.refreshLocked()
 	}
 	m.mu.Unlock()
-	if looked && !changed {
-		return false
-	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -519,8 +514,60 @@ func lookupSockOwner(network string, ip netip.Addr, srcPort int, peers []netip.A
 	return sockOwnerValue{}, false
 }
 
+// lookupSockOwnerProcess looks up a connection's recorded owner and resolves
+// its executable path under the same map lock when exec-path maps are open,
+// so a concurrent detach or restart between the two cannot fall through to /proc.
+func lookupSockOwnerProcess(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (owner sockOwnerValue, path string, ok bool, err error) {
+	key, valid := newSockOwnerKey(network, ip, srcPort)
+	if !valid {
+		return sockOwnerValue{}, "", false, nil
+	}
+	consulted := false
+	useProc := false
+	found := sockOwners.lookup(func(fd int, netns uint64) bool {
+		consulted = true
+		key.Netns = netns
+		var matched bool
+		if flow, ok := sockOwners.lookupFlowLocked(key, peers); ok {
+			owner = flow.owner()
+			matched = true
+		} else {
+			matched = lookupBPFMap(fd, &key, &owner)
+		}
+		if !matched || owner.Tgid == 0 {
+			return false
+		}
+		if !inInitialPidNamespace() {
+			err = errNotInitialPidNS
+			return true
+		}
+		if sockOwners.tasksFd >= 0 {
+			path, err = sockOwners.execPathLocked(owner)
+			return true
+		}
+		if sockOwners.only {
+			err = ErrNotFound
+			return true
+		}
+		useProc = true
+		return true
+	})
+	if !found {
+		if consulted {
+			lookupCounters.bpfMisses.Add(1)
+		}
+		return sockOwnerValue{}, "", false, nil
+	}
+	lookupCounters.bpfHits.Add(1)
+	if useProc {
+		path, err = readSockOwnerExe(owner)
+	}
+	return owner, path, true, err
+}
+
 var (
 	errSockOwnerGone   = errors.New("socket owner exited")
+	errSockOwnerExec   = errors.New("socket owner executable unavailable")
 	errNotInitialPidNS = errors.New("not in the initial PID namespace")
 )
 
@@ -558,10 +605,11 @@ func isInitialPidNamespace(link string) bool {
 }
 
 // sockOwnerPathFallback reports whether a failed sock-owner lookup may fall
-// back to the usual netlink and /proc search. A reused process ID or a nested
-// PID namespace must not: that search could name a different process.
+// back to the usual netlink and /proc search. A reused process ID, a nested
+// PID namespace, or an exec-map record whose path could not be decoded must
+// not: that search could name a different process or discard the owner's UID.
 func sockOwnerPathFallback(err error) bool {
-	return !errors.Is(err, errSockOwnerGone) && !errors.Is(err, errNotInitialPidNS)
+	return !errors.Is(err, errSockOwnerGone) && !errors.Is(err, errSockOwnerExec) && !errors.Is(err, errNotInitialPidNS)
 }
 
 // resolveSockOwnerPath returns the executable of the recorded owner, from the
@@ -620,7 +668,7 @@ func (m *sockOwnerMap) execPathLocked(owner sockOwnerValue) (string, error) {
 	}
 	path, err := value.execPath()
 	if err != nil {
-		return "", fmt.Errorf("executable of process %d: %w", owner.Tgid, err)
+		return "", fmt.Errorf("executable of process %d: %w: %w", owner.Tgid, errSockOwnerExec, err)
 	}
 	return path, nil
 }

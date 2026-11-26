@@ -48,10 +48,11 @@ func (v *sockFlowValue) owner() sockOwnerValue {
 func flowKeys(key sockOwnerKey, peers []netip.AddrPort) []sockFlowKey {
 	keys := make([]sockFlowKey, 0, len(peers))
 	for _, peer := range peers {
-		if !peer.Addr().IsValid() || peer.Port() == 0 {
+		addr := peer.Addr().Unmap()
+		if !addr.IsValid() || addr.IsUnspecified() || peer.Port() == 0 {
 			continue
 		}
-		k := sockFlowKey{Netns: key.Netns, Saddr: key.Addr, Daddr: peer.Addr().Unmap().As16(),
+		k := sockFlowKey{Netns: key.Netns, Saddr: key.Addr, Daddr: addr.As16(),
 			Sport: key.Port, Dport: peer.Port(), Proto: key.Proto}
 		duplicate := false
 		for _, seen := range keys {

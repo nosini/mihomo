@@ -191,6 +191,29 @@ func TestLookupHealthDisabled(t *testing.T) {
 	}
 }
 
+func TestLookupHealthClearsErrorAfterDetach(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "conn_owners")
+	owners := &sockOwnerMap{
+		path:      missing,
+		fd:        -1,
+		tasksFd:   -1,
+		recentFd:  -1,
+		cgroupsFd: -1,
+		pathsFd:   -1,
+		flowsFd:   -1,
+		openErr:   "stale open error",
+		execErr:   "stale exec error",
+		cgroupErr: "stale cgroup error",
+	}
+	_, winePin := freshPins(time.Now())
+	swapLookups(t, owners, &wineFlows{flowsFd: -1, peerFlowsFd: -1, heartbeatFd: -1, pinned: winePin})
+
+	h := LookupHealth()
+	if h.Maps.Open || h.Maps.Error != "" || h.Maps.ExecMapsError != "" || h.Cgroups.MapError != "" {
+		t.Fatalf("errors after detach not cleared: maps=%+v cgroups=%+v", h.Maps, h.Cgroups)
+	}
+}
+
 // A lookup against an open fd that is no BPF map counts as a miss; the maps
 // were consulted and answered nothing.
 func TestLookupSockOwnerCountsMiss(t *testing.T) {

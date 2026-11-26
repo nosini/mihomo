@@ -30,19 +30,141 @@ diff --git a/component/process/process_linux.go b/component/process/process_linu
 index 44ad93a..c1adff5 100644
 --- a/component/process/process_linux.go
 +++ b/component/process/process_linux.go
-@@ -63,7 +63,11 @@ type inetDiagResponse struct {
+@@ -63,11 +63,14 @@ type inetDiagResponse struct {
  }
  
  func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
 -	if owner, ok := lookupSockOwner(network, ip, srcPort); ok {
+-		path, err := resolveSockOwnerPath(owner)
 +	return findProcessNameTo(network, ip, srcPort, nil)
 +}
 +
 +func findProcessNameTo(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (uint32, string, error) {
-+	if owner, ok := lookupSockOwner(network, ip, srcPort, peers); ok {
- 		path, err := resolveSockOwnerPath(owner)
++	if owner, path, ok, err := lookupSockOwnerProcess(network, ip, srcPort, peers); ok {
  		if err == nil {
  			return owner.UID, path, nil
+ 		}
+ 		// Keep the owner's UID usable when only its path is unavailable,
+ 		// but never report an empty path as a process match.
+ 		if SockOwnerOnly() || !sockOwnerPathFallback(err) {
+@@ -79,7 +82,7 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
+ 	}
+ 	lookupCounters.procFallbacks.Add(1)
+ 
+-	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort)
++	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort, peers...)
+ 	if runtime.GOOS == "android" {
+ 		// on Android (especially recent releases), netlink INET_DIAG can fail or return UID 0 / empty process info for some apps
+ 		// so trying fallback to resolve /proc/net/{tcp,tcp6,udp,udp6}
+@@ -106,7 +109,7 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
+ 	return uid, pp, err
+ }
+ 
+-func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uint32, inode uint32, err error) {
++func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int, peers ...netip.AddrPort) (uid uint32, inode uint32, err error) {
+ 	request := &inetDiagRequest{
+ 		States: 0xffffffff,
+ 		Cookie: [2]uint32{0xffffffff, 0xffffffff},
+@@ -149,43 +152,83 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
+ 		return 0, 0, err
+ 	}
+ 
+-	err = ErrNotFound
++	return matchInetDiagResponses(messages, ip, srcPort, peers)
++}
++
++func matchInetDiagResponses(messages []netlink.Message, ip netip.Addr, srcPort int, peers []netip.AddrPort) (uid uint32, inode uint32, err error) {
++	wantSrc := ip.Unmap()
++	wantPort := uint16(srcPort)
++	validPeers := make([]netip.AddrPort, 0, len(peers))
++	for _, peer := range peers {
++		addr := peer.Addr().Unmap()
++		if addr.IsValid() && !addr.IsUnspecified() && peer.Port() != 0 {
++			validPeers = append(validPeers, netip.AddrPortFrom(addr, peer.Port()))
++		}
++	}
++
++	var (
++		hasFallback         bool
++		fallbackUnconnected bool
++		fallbackUID         uint32
++		fallbackInode       uint32
++	)
++
+ 	for _, msg := range messages {
+ 		if len(msg.Data) < inetDiagResponseSize {
+ 			continue
+ 		}
+ 
+ 		response := (*inetDiagResponse)(unsafe.Pointer(&msg.Data[0]))
+ 
+-		// always set to allow fallback when check fails
+-		uid, inode, err = response.UID, response.INode, nil
+-
+ 		// check src port
+-		if binary.BigEndian.Uint16(response.SrcPort[:]) != uint16(srcPort) {
++		if binary.BigEndian.Uint16(response.SrcPort[:]) != wantPort {
+ 			continue
+ 		}
+ 
+ 		// check src IP
+-		var src netip.Addr
++		var src, dst netip.Addr
+ 		switch response.Family {
+ 		case unix.AF_INET:
+-			var a [4]byte
+-			copy(a[:], response.Src[:4])
+-			src = netip.AddrFrom4(a)
++			var sa, da [4]byte
++			copy(sa[:], response.Src[:4])
++			copy(da[:], response.Dst[:4])
++			src = netip.AddrFrom4(sa)
++			dst = netip.AddrFrom4(da)
+ 		case unix.AF_INET6:
+-			var a [16]byte
+-			copy(a[:], response.Src[:])
+-			src = netip.AddrFrom16(a).Unmap()
++			var sa, da [16]byte
++			copy(sa[:], response.Src[:])
++			copy(da[:], response.Dst[:])
++			src = netip.AddrFrom16(sa).Unmap()
++			dst = netip.AddrFrom16(da).Unmap()
+ 		default:
+ 			continue
+ 		}
+-		if src != ip.Unmap() {
++		if src != wantSrc {
+ 			continue
+ 		}
+ 
+-		// this is the one we want
+-		break
++		if len(validPeers) == 0 {
++			return response.UID, response.INode, nil
++		}
++
++		dstPort := binary.BigEndian.Uint16(response.DstPort[:])
++		for _, peer := range validPeers {
++			if dst == peer.Addr() && dstPort == peer.Port() {
++				return response.UID, response.INode, nil
++			}
++		}
++
++		unconnected := dst.IsUnspecified() && dstPort == 0
++		if !hasFallback || (unconnected && !fallbackUnconnected) {
++			hasFallback = true
++			fallbackUnconnected = unconnected
++			fallbackUID = response.UID
++			fallbackInode = response.INode
++		}
+ 	}
+ 
+-	return
++	if hasFallback {
++		return fallbackUID, fallbackInode, nil
++	}
++	return 0, 0, ErrNotFound
+ }
 diff --git a/constant/metadata.go b/constant/metadata.go
 index de55b11..075670d 100644
 --- a/constant/metadata.go
@@ -59,15 +181,23 @@ index de55b11..075670d 100644
  	// The Windows program behind a Wine connection, beside the process owning its socket
  	WineProcess     string `json:"wineProcess,omitempty"`
  	WineProcessPath string `json:"wineProcessPath,omitempty"`
-@@ -330,6 +335,13 @@ func (m *Metadata) Pure() *Metadata {
+@@ -330,6 +335,21 @@ func (m *Metadata) Pure() *Metadata {
  	return m
  }
  
 +// FlowPeers returns the destinations the connection's outgoing packets may
-+// have carried when they left their socket: the packet destination, or the
-+// inbound's own address when netfilter redirected them to it.
++// have carried when they left their socket: the packet destination for TUN
++// and TPROXY, and the inbound listener's address for proxy, tunnel and REDIR
++// inbounds.
 +func (m *Metadata) FlowPeers() []netip.AddrPort {
-+	return []netip.AddrPort{m.PacketDst, netip.AddrPortFrom(m.InIP.Unmap(), m.InPort)}
++	switch m.Type {
++	case TUN, TPROXY:
++		return []netip.AddrPort{m.PacketDst}
++	case INNER:
++		return nil
++	default:
++		return []netip.AddrPort{netip.AddrPortFrom(m.InIP.Unmap(), m.InPort)}
++	}
 +}
 +
  func (m *Metadata) Clone() *Metadata {

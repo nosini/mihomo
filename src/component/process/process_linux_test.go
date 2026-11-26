@@ -3,13 +3,17 @@
 package process
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"unsafe"
 
+	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -98,6 +102,79 @@ func TestResolveProcessNameByProcEntries(t *testing.T) {
 		got, err := resolveProcessNameByProcSearch(inode, uid)
 		if err != nil || got != want {
 			t.Fatalf("process = %q, error = %v; want %q, nil", got, err, want)
+		}
+	})
+}
+
+func diagMessage(family byte, src, dst netip.Addr, srcPort, dstPort uint16, uid, inode uint32) netlink.Message {
+	var resp inetDiagResponse
+	resp.Family = family
+	binary.BigEndian.PutUint16(resp.SrcPort[:], srcPort)
+	binary.BigEndian.PutUint16(resp.DstPort[:], dstPort)
+	if family == unix.AF_INET {
+		s4 := src.As4()
+		d4 := dst.As4()
+		copy(resp.Src[:4], s4[:])
+		copy(resp.Dst[:4], d4[:])
+	} else {
+		s16 := src.As16()
+		d16 := dst.As16()
+		copy(resp.Src[:], s16[:])
+		copy(resp.Dst[:], d16[:])
+	}
+	resp.UID = uid
+	resp.INode = inode
+	raw := (*(*[inetDiagResponseSize]byte)(unsafe.Pointer(&resp)))[:]
+	data := append([]byte(nil), raw...)
+	return netlink.Message{Data: data}
+}
+
+func TestMatchInetDiagResponses(t *testing.T) {
+	src := netip.MustParseAddr("198.18.0.1")
+	otherIP := netip.MustParseAddr("198.18.0.2")
+	peerA := netip.MustParseAddrPort("1.1.1.1:443")
+	peerB := netip.MustParseAddrPort("2.2.2.2:443")
+
+	t.Run("unmatched dump returns ErrNotFound", func(t *testing.T) {
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET, otherIP, peerA.Addr(), 5000, 443, 1001, 111),
+			diagMessage(unix.AF_INET, src, peerA.Addr(), 5001, 443, 1002, 222),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerA})
+		if !errors.Is(err, ErrNotFound) || uid != 0 || inode != 0 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 0, 0, ErrNotFound", uid, inode, err)
+		}
+	})
+
+	t.Run("prefers exact peer on shared source port", func(t *testing.T) {
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET, src, peerA.Addr(), 5000, 443, 1001, 111),
+			diagMessage(unix.AF_INET6, netip.AddrFrom16(src.As16()), netip.AddrFrom16(peerB.Addr().As16()), 5000, 443, 1002, 222),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerB})
+		if err != nil || uid != 1002 || inode != 222 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 1002, 222, nil", uid, inode, err)
+		}
+	})
+
+	t.Run("prefers unconnected UDP socket over unrelated peer", func(t *testing.T) {
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET, src, peerA.Addr(), 5000, 443, 1001, 111),
+			diagMessage(unix.AF_INET, src, netip.IPv4Unspecified(), 5000, 0, 1003, 333),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerB})
+		if err != nil || uid != 1003 || inode != 333 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 1003, 333, nil", uid, inode, err)
+		}
+	})
+
+	t.Run("falls back to matching source when peer differs (REDIR)", func(t *testing.T) {
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET, src, peerA.Addr(), 5000, 443, 1001, 111),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:7892")})
+		if err != nil || uid != 1001 || inode != 111 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 1001, 111, nil", uid, inode, err)
 		}
 	})
 }

@@ -2,6 +2,7 @@ package process
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"testing"
 	"unsafe"
@@ -91,6 +92,7 @@ func TestSockOwnerPathFallback(t *testing.T) {
 	}{
 		{"reused pid", errSockOwnerGone, false},
 		{"nested pid namespace", errNotInitialPidNS, false},
+		{"exec path decode error", fmt.Errorf("executable of process 1: %w: %w", errSockOwnerExec, unix.ENAMETOOLONG), false},
 		{"no record", ErrNotFound, true},
 	} {
 		if got := sockOwnerPathFallback(tc.err); got != tc.want {
