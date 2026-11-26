@@ -144,7 +144,7 @@ func TestFlowRecordsPreferred(t *testing.T) {
 			}
 		})
 	}
-	if id, ok := lookupSockCgroup("tcp", source.Addr(), int(source.Port()), []netip.AddrPort{librewolf}); !ok || id != 77 {
+	if id, _, ok, _ := lookupSockCgroup("tcp", source.Addr(), int(source.Port()), []netip.AddrPort{librewolf}); !ok || id != 77 {
 		t.Errorf("cgroup = %d, %v; want the flow record's 77", id, ok)
 	}
 }

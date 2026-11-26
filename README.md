@@ -69,7 +69,10 @@ loader separately. For Wine names, also install its Wine observer and run it
 before launching games.
 [hardened-proxy-service](https://github.com/nosini/hardened-proxy-service)
 provides systemd units, map permissions and SELinux policy. Its Wine observer
-unit is optional and must be enabled separately.
+unit is optional: the unit has no `[Install]` section, and the package's
+generator starts it together with the service whenever its file is installed
+and process lookup runs through the loader's maps — with the default
+`/run/mihomo-bpf/conn_owners` path in /proc mode, or with BPF-only mode on.
 
 See [process lookup configuration](docs/socketowner.md) for the map settings,
 fallback behavior, rule details and integration tests. For example, with the

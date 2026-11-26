@@ -90,12 +90,10 @@ func (m *sockOwnerMap) openCgroupMapLocked() {
 	m.cgroupErr = ""
 }
 
-// recordedCgroupPath returns the path the loader recorded for a cgroup ID.
-// usesMap is false when the loader records no paths, so that the caller
-// names the cgroup through cgroupfs instead.
-func (m *sockOwnerMap) recordedCgroupPath(id uint64) (path string, ok, usesMap bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// recordedCgroupPathLocked returns the path the loader recorded for a cgroup
+// ID, with m.mu held for reading. usesMap is false when the loader records no
+// paths, so that the caller names the cgroup through cgroupfs instead.
+func (m *sockOwnerMap) recordedCgroupPathLocked(id uint64) (path string, ok, usesMap bool) {
 	usesMap = m.pathsFd >= 0 || m.features&featureCgroupPaths != 0
 	if m.pathsFd < 0 {
 		return "", false, usesMap
@@ -124,11 +122,15 @@ func (m *sockOwnerMap) noteCgroupUnavailable() {
 }
 
 // lookupSockCgroup returns the cgroup ID recorded for a connection's owner,
-// from the record of its exact flow where there is one.
-func lookupSockCgroup(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (uint64, bool) {
-	key, ok := newSockOwnerKey(network, ip, srcPort)
-	if !ok {
-		return 0, false
+// from the record of its exact flow where there is one, and the path the
+// loader recorded for it under the same read lock: a detach between two
+// lookups would otherwise reset the map state and send a loader that records
+// paths to cgroupfs. ok is false without a cgroup ID, and for a loader that
+// records paths also when it has no record of the cgroup.
+func lookupSockCgroup(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (id uint64, path string, ok, usesMap bool) {
+	key, valid := newSockOwnerKey(network, ip, srcPort)
+	if !valid {
+		return 0, "", false, false
 	}
 	m := sockOwners
 	var owner sockOwnerValue
@@ -144,33 +146,47 @@ func lookupSockCgroup(network string, ip netip.Addr, srcPort int, peers []netip.
 			return false
 		}
 		// A flow record holds its owner's cgroup, written with it.
-		if flow, ok := m.lookupFlowLocked(key, peers); ok {
+		if flow, fromFlow := m.lookupFlowLocked(key, peers); fromFlow {
 			cg.CgroupID = flow.CgroupID
-			return flow.Tgid != 0 && flow.CgroupID != 0
+			if flow.Tgid == 0 || flow.CgroupID == 0 {
+				return false
+			}
+		} else {
+			if !lookupBPFMap(fd, &key, &owner) || owner.Tgid == 0 {
+				return false
+			}
+			if !lookupBPFMap(m.cgroupsFd, &key, &cg) || !cg.belongsTo(owner) {
+				return false
+			}
 		}
-		if !lookupBPFMap(fd, &key, &owner) || owner.Tgid == 0 {
-			return false
+		// The cgroup ID is known: name it through the recorded paths while
+		// the same read lock holds. A loader that records paths knows every
+		// cgroup its hooks saw, so a missing record reads as unknown rather
+		// than sending mihomo to cgroupfs.
+		id = cg.CgroupID
+		var pathKnown bool
+		path, pathKnown, usesMap = m.recordedCgroupPathLocked(id)
+		if usesMap {
+			return pathKnown
 		}
-		return lookupBPFMap(m.cgroupsFd, &key, &cg) && cg.belongsTo(owner)
+		return true
 	})
 	if unavailable {
 		m.noteCgroupUnavailable()
 	}
 	if !found {
-		return 0, false
+		return 0, "", false, false
 	}
-	return cg.CgroupID, true
+	return id, path, true, usesMap
 }
 
 func findCgroup(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (string, bool) {
-	id, ok := lookupSockCgroup(network, ip, srcPort, peers)
+	id, path, ok, usesMap := lookupSockCgroup(network, ip, srcPort, peers)
 	if !ok {
 		lookupCounters.cgroupUnknown.Add(1)
 		return "", false
 	}
-	// A loader that records paths knows every cgroup its hooks saw, so a
-	// missing entry stays unknown rather than sending mihomo to cgroupfs.
-	path, ok, usesMap := sockOwners.recordedCgroupPath(id)
+	// A loader that records no paths names its cgroups through cgroupfs.
 	if !usesMap {
 		path, ok = cgroupPaths.path(id)
 	}

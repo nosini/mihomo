@@ -140,7 +140,7 @@ func TestMatchInetDiagResponses(t *testing.T) {
 			diagMessage(unix.AF_INET, otherIP, peerA.Addr(), 5000, 443, 1001, 111),
 			diagMessage(unix.AF_INET, src, peerA.Addr(), 5001, 443, 1002, 222),
 		}
-		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerA})
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerA}, true)
 		if !errors.Is(err, ErrNotFound) || uid != 0 || inode != 0 {
 			t.Fatalf("got uid=%d inode=%d err=%v; want 0, 0, ErrNotFound", uid, inode, err)
 		}
@@ -151,7 +151,7 @@ func TestMatchInetDiagResponses(t *testing.T) {
 			diagMessage(unix.AF_INET, src, peerA.Addr(), 5000, 443, 1001, 111),
 			diagMessage(unix.AF_INET6, netip.AddrFrom16(src.As16()), netip.AddrFrom16(peerB.Addr().As16()), 5000, 443, 1002, 222),
 		}
-		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerB})
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerB}, true)
 		if err != nil || uid != 1002 || inode != 222 {
 			t.Fatalf("got uid=%d inode=%d err=%v; want 1002, 222, nil", uid, inode, err)
 		}
@@ -160,9 +160,9 @@ func TestMatchInetDiagResponses(t *testing.T) {
 	t.Run("prefers unconnected UDP socket over unrelated peer", func(t *testing.T) {
 		msgs := []netlink.Message{
 			diagMessage(unix.AF_INET, src, peerA.Addr(), 5000, 443, 1001, 111),
-			diagMessage(unix.AF_INET, src, netip.IPv4Unspecified(), 5000, 0, 1003, 333),
+			diagMessage(unix.AF_INET, netip.IPv4Unspecified(), netip.IPv4Unspecified(), 5000, 0, 1003, 333),
 		}
-		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerB})
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerB}, true)
 		if err != nil || uid != 1003 || inode != 333 {
 			t.Fatalf("got uid=%d inode=%d err=%v; want 1003, 333, nil", uid, inode, err)
 		}
@@ -172,9 +172,86 @@ func TestMatchInetDiagResponses(t *testing.T) {
 		msgs := []netlink.Message{
 			diagMessage(unix.AF_INET, src, peerA.Addr(), 5000, 443, 1001, 111),
 		}
-		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:7892")})
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:7892")}, false)
 		if err != nil || uid != 1001 || inode != 111 {
 			t.Fatalf("got uid=%d inode=%d err=%v; want 1001, 111, nil", uid, inode, err)
+		}
+	})
+
+	// Unconnected UDP sockets report a wildcard source in INET_DIAG unless
+	// the program bound one.
+	t.Run("finds wildcard unconnected IPv4 UDP socket", func(t *testing.T) {
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET, netip.IPv4Unspecified(), netip.IPv4Unspecified(), 5000, 0, 1004, 444),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerA}, true)
+		if err != nil || uid != 1004 || inode != 444 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 1004, 444, nil", uid, inode, err)
+		}
+	})
+
+	t.Run("finds wildcard unconnected IPv6 UDP socket", func(t *testing.T) {
+		src6 := netip.MustParseAddr("fd00::1")
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET6, netip.IPv6Unspecified(), netip.IPv6Unspecified(), 5000, 0, 1005, 555),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src6, 5000, []netip.AddrPort{netip.MustParseAddrPort("[2600::]:443")}, true)
+		if err != nil || uid != 1005 || inode != 555 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 1005, 555, nil", uid, inode, err)
+		}
+	})
+
+	t.Run("bound unconnected UDP beats wildcard in either order", func(t *testing.T) {
+		bound := diagMessage(unix.AF_INET, src, netip.IPv4Unspecified(), 5000, 0, 1006, 666)
+		wildcard := diagMessage(unix.AF_INET, netip.IPv4Unspecified(), netip.IPv4Unspecified(), 5000, 0, 1007, 777)
+		for _, msgs := range [][]netlink.Message{{bound, wildcard}, {wildcard, bound}} {
+			uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerB}, true)
+			if err != nil || uid != 1006 || inode != 666 {
+				t.Fatalf("got uid=%d inode=%d err=%v; want 1006, 666, nil", uid, inode, err)
+			}
+		}
+	})
+
+	// A TCP entry with an unspecified destination is a listener on the port.
+	t.Run("TCP listener loses to established socket in either order", func(t *testing.T) {
+		listener := diagMessage(unix.AF_INET, src, netip.IPv4Unspecified(), 5000, 0, 1008, 888)
+		established := diagMessage(unix.AF_INET, src, netip.MustParseAddr("9.9.9.9"), 5000, 80, 1009, 999)
+		for _, msgs := range [][]netlink.Message{{listener, established}, {established, listener}} {
+			uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerA}, false)
+			if err != nil || uid != 1009 || inode != 999 {
+				t.Fatalf("got uid=%d inode=%d err=%v; want 1009, 999, nil", uid, inode, err)
+			}
+		}
+	})
+
+	t.Run("without peers bound socket beats wildcard UDP", func(t *testing.T) {
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET, netip.IPv4Unspecified(), netip.IPv4Unspecified(), 5000, 0, 1003, 333),
+			diagMessage(unix.AF_INET, src, netip.IPv4Unspecified(), 5000, 0, 1004, 444),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, nil, true)
+		if err != nil || uid != 1004 || inode != 444 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 1004, 444, nil", uid, inode, err)
+		}
+	})
+
+	t.Run("without peers falls back to wildcard unconnected UDP", func(t *testing.T) {
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET, netip.IPv4Unspecified(), netip.IPv4Unspecified(), 5000, 0, 1007, 777),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, nil, true)
+		if err != nil || uid != 1007 || inode != 777 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 1007, 777, nil", uid, inode, err)
+		}
+	})
+
+	t.Run("ignores wildcard UDP socket with a peer", func(t *testing.T) {
+		msgs := []netlink.Message{
+			diagMessage(unix.AF_INET, netip.IPv4Unspecified(), peerA.Addr(), 5000, 443, 1010, 1010),
+		}
+		uid, inode, err := matchInetDiagResponses(msgs, src, 5000, nil, true)
+		if !errors.Is(err, ErrNotFound) || uid != 0 || inode != 0 {
+			t.Fatalf("got uid=%d inode=%d err=%v; want 0, 0, ErrNotFound", uid, inode, err)
 		}
 	})
 }

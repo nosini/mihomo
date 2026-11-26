@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"testing"
 	"unsafe"
 
@@ -112,6 +113,33 @@ func TestIsInitialPidNamespace(t *testing.T) {
 		if got := isInitialPidNamespace(link); got != want {
 			t.Errorf("%q: got %v, want %v", link, got, want)
 		}
+	}
+}
+
+// A pin that disappears clears the last warning, so the same open error is
+// reported when the pin comes back with it.
+func TestPinnedMapSetWarnsAgainAfterMissingPin(t *testing.T) {
+	var p pinnedMapSet
+	openErr := errors.New("unexpected map layout")
+	if !p.warnOnce(openErr) {
+		t.Fatal("the first warning was suppressed")
+	}
+	if p.warnOnce(openErr) {
+		t.Fatal("the repeated warning was not suppressed")
+	}
+	closed := 0
+	changed, err := p.refresh(filepath.Join(t.TempDir(), "missing_pin"), func() { closed++ }, func() error {
+		t.Fatal("opened a missing pin")
+		return nil
+	})
+	if err != nil || changed {
+		t.Fatalf("refresh of a missing pin: changed %v, err %v", changed, err)
+	}
+	if closed != 1 {
+		t.Fatalf("closed %d times, want 1", closed)
+	}
+	if !p.warnOnce(openErr) {
+		t.Fatal("the warning stayed suppressed after the pin disappeared")
 	}
 }
 

@@ -110,6 +110,9 @@ func (p *pinnedMapSet) refresh(path string, close func(), open func() error) (ch
 		close()
 		p.ino = 0
 		if errors.Is(err, unix.ENOENT) {
+			// A missing pin is a clean state: forget the last warning, so
+			// the same open error is reported if the pin comes back.
+			p.warned = ""
 			return hadOpen, nil
 		}
 		return hadOpen, err

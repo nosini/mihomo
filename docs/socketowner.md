@@ -278,7 +278,9 @@ one map lookup for the Wine heartbeat.
 ```
 
 The error fields are left out while everything opens; a broken setup adds them,
-for example after installing a loader with an unsupported map interface:
+for example after installing a loader with an unsupported map interface. The
+exec-path maps are opened only beside a socket-owner map that opens, so
+`maps.execMapsError` stays empty in this snapshot:
 
 ```json
 {
@@ -289,8 +291,7 @@ for example after installing a loader with an unsupported map interface:
     "open": false,
     "abiVersion": 0,
     "error": "socketowner ABI (install a compatible socketowner loader): unsupported ABI v2 in /run/mihomo-bpf/abi_version (need v1)",
-    "execMapsOpen": false,
-    "execMapsError": "open /run/mihomo-bpf/exec_tasks: no such file or directory"
+    "execMapsOpen": false
   },
   "wine": {
     "present": false,
@@ -327,9 +328,13 @@ The fields:
   `maps.error` holds the last error from opening or validating the maps, such as
   an unsupported ABI version. It is empty while they are open, and also when
   nothing is pinned at the configured path yet, because a loader may start
-  later. `maps.execMapsOpen` and `maps.execMapsError` report the exec-path maps
-  the same way; while they are open, executable paths are resolved without
-  reading `/proc`.
+  later. `maps.execMapsOpen` and `maps.execMapsError` report the exec-path maps:
+  while they are open, executable paths are resolved without reading `/proc`.
+  `maps.execMapsError` holds the last error from opening them beside an open
+  socket-owner map, such as a loader started without `-exec-paths`, whose
+  missing pins are recorded. It is empty while the exec-path maps are open, and
+  also while the socket-owner map is closed, because they are only opened
+  beside one that is open.
 - `wine.present` is true while the Wine maps are open and `wine.abiVersion` is
   their version. `wine.heartbeatAgeSeconds` is the age of the observer's
   heartbeat in seconds, left out when it cannot be read and negative when the

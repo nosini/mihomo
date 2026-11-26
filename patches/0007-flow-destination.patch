@@ -27,10 +27,10 @@ index 18a8003..8d08a73 100644
  
  // PackageNameResolver
 diff --git a/component/process/process_linux.go b/component/process/process_linux.go
-index 44ad93a..c1adff5 100644
+index 44ad93ac..22dd290e 100644
 --- a/component/process/process_linux.go
 +++ b/component/process/process_linux.go
-@@ -63,11 +63,14 @@ type inetDiagResponse struct {
+@@ -63,8 +63,11 @@ type inetDiagResponse struct {
  }
  
  func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
@@ -44,9 +44,6 @@ index 44ad93a..c1adff5 100644
  		if err == nil {
  			return owner.UID, path, nil
  		}
- 		// Keep the owner's UID usable when only its path is unavailable,
- 		// but never report an empty path as a process match.
- 		if SockOwnerOnly() || !sockOwnerPathFallback(err) {
 @@ -79,7 +82,7 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
  	}
  	lookupCounters.procFallbacks.Add(1)
@@ -65,15 +62,34 @@ index 44ad93a..c1adff5 100644
  	request := &inetDiagRequest{
  		States: 0xffffffff,
  		Cookie: [2]uint32{0xffffffff, 0xffffffff},
-@@ -149,43 +152,83 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
+@@ -118,9 +121,10 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
+ 		request.Family = unix.AF_INET6
+ 	}
+ 
++	isUDP := strings.HasPrefix(network, "udp")
+ 	if strings.HasPrefix(network, "tcp") {
+ 		request.Protocol = unix.IPPROTO_TCP
+-	} else if strings.HasPrefix(network, "udp") {
++	} else if isUDP {
+ 		request.Protocol = unix.IPPROTO_UDP
+ 	} else {
+ 		return 0, 0, ErrInvalidNetwork
+@@ -149,7 +153,43 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
  		return 0, 0, err
  	}
  
 -	err = ErrNotFound
-+	return matchInetDiagResponses(messages, ip, srcPort, peers)
++	return matchInetDiagResponses(messages, ip, srcPort, peers, isUDP)
 +}
 +
-+func matchInetDiagResponses(messages []netlink.Message, ip netip.Addr, srcPort int, peers []netip.AddrPort) (uid uint32, inode uint32, err error) {
++// matchInetDiagResponses picks the socket for a source address and port from
++// an INET_DIAG dump. For UDP, an unconnected socket reports a wildcard
++// source address unless the program bound one, so entries with either source
++// count; a connected socket always carries its bound address, so a wildcard
++// source on a connected entry is skipped. For TCP an entry with an
++// unspecified destination is a listener on the port, not the client, and
++// never wins over an entry with a peer.
++func matchInetDiagResponses(messages []netlink.Message, ip netip.Addr, srcPort int, peers []netip.AddrPort, isUDP bool) (uid uint32, inode uint32, err error) {
 +	wantSrc := ip.Unmap()
 +	wantPort := uint16(srcPort)
 +	validPeers := make([]netip.AddrPort, 0, len(peers))
@@ -84,17 +100,26 @@ index 44ad93a..c1adff5 100644
 +		}
 +	}
 +
++	// Fallbacks without a peer match, most specific first: a socket on the
++	// address that is unconnected, one bound to the wildcard address that is
++	// unconnected, and any other socket on the address.
 +	var (
-+		hasFallback         bool
-+		fallbackUnconnected bool
-+		fallbackUID         uint32
-+		fallbackInode       uint32
++		fallbackUID   [3]uint32
++		fallbackInode [3]uint32
++		hasFallback   [3]bool
 +	)
++	setFallback := func(i int, response *inetDiagResponse) {
++		if !hasFallback[i] {
++			hasFallback[i] = true
++			fallbackUID[i] = response.UID
++			fallbackInode[i] = response.INode
++		}
++	}
 +
  	for _, msg := range messages {
  		if len(msg.Data) < inetDiagResponseSize {
  			continue
- 		}
+@@ -157,37 +197,86 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
  
  		response := (*inetDiagResponse)(unsafe.Pointer(&msg.Data[0]))
  
@@ -133,38 +158,70 @@ index 44ad93a..c1adff5 100644
  			continue
  		}
 -		if src != ip.Unmap() {
-+		if src != wantSrc {
- 			continue
+-			continue
++
++		srcMatch := src == wantSrc
++		if !srcMatch {
++			// A wildcard source is accepted only for UDP, whose
++			// unconnected sockets report one.
++			if !isUDP || !src.IsUnspecified() {
++				continue
++			}
++		}
++
++		dstPort := binary.BigEndian.Uint16(response.DstPort[:])
++
++		if len(validPeers) == 0 {
++			if srcMatch {
++				return response.UID, response.INode, nil
++			}
++			// Without peers, a socket on the wildcard address is a
++			// fallback, not the answer.
++		} else if srcMatch {
++			for _, peer := range validPeers {
++				if dst == peer.Addr() && dstPort == peer.Port() {
++					return response.UID, response.INode, nil
++				}
++			}
  		}
  
 -		// this is the one we want
 -		break
-+		if len(validPeers) == 0 {
-+			return response.UID, response.INode, nil
-+		}
-+
-+		dstPort := binary.BigEndian.Uint16(response.DstPort[:])
-+		for _, peer := range validPeers {
-+			if dst == peer.Addr() && dstPort == peer.Port() {
-+				return response.UID, response.INode, nil
-+			}
-+		}
-+
 +		unconnected := dst.IsUnspecified() && dstPort == 0
-+		if !hasFallback || (unconnected && !fallbackUnconnected) {
-+			hasFallback = true
-+			fallbackUnconnected = unconnected
-+			fallbackUID = response.UID
-+			fallbackInode = response.INode
++		switch {
++		case !isUDP:
++			// For TCP, an entry with an unspecified destination is a
++			// listener on the port: keep only entries with a peer.
++			if !unconnected {
++				setFallback(2, response)
++			}
++		case unconnected:
++			// An unconnected UDP socket is the usual client: one bound to
++			// the address beats one bound to the wildcard address.
++			if srcMatch {
++				setFallback(0, response)
++			} else {
++				setFallback(1, response)
++			}
++		case srcMatch:
++			// A connected socket on the address, to a peer that was not
++			// asked about.
++			setFallback(2, response)
++		default:
++			// A connected socket cannot have a wildcard source.
 +		}
  	}
  
 -	return
-+	if hasFallback {
-+		return fallbackUID, fallbackInode, nil
++	for i := range hasFallback {
++		if hasFallback[i] {
++			return fallbackUID[i], fallbackInode[i], nil
++		}
 +	}
 +	return 0, 0, ErrNotFound
  }
+ 
+ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
 diff --git a/constant/metadata.go b/constant/metadata.go
 index de55b11..075670d 100644
 --- a/constant/metadata.go

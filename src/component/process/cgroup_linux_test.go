@@ -329,7 +329,10 @@ func TestCgroupNamesWarnsOnlyWhenWanted(t *testing.T) {
 // map still reads as BPF and no lookup falls back to cgroupfs.
 func TestCgroupPathsBPFWithoutMaps(t *testing.T) {
 	m := &sockOwnerMap{fd: 3, cgroupsFd: -1, pathsFd: -1, features: featureCgroupPaths, cgroupErr: "cgroup_paths: missing"}
-	if path, ok, usesMap := m.recordedCgroupPath(1); ok || path != "" || !usesMap {
+	m.mu.RLock()
+	path, ok, usesMap := m.recordedCgroupPathLocked(1)
+	m.mu.RUnlock()
+	if ok || path != "" || !usesMap {
 		t.Fatalf("recorded path %q, %v, %v; want empty, false, true", path, ok, usesMap)
 	}
 	previous := cgroupPaths
@@ -365,7 +368,7 @@ func TestLookupSockCgroupNeedsCgroupMap(t *testing.T) {
 		cgroupErr: "cgroup_paths: missing",
 		pinned:    pinnedMapSet{checkedAt: time.Now()},
 	}
-	if id, ok := lookupSockCgroup("tcp", netip.MustParseAddr("127.0.0.1"), 1234, nil); ok {
+	if id, _, ok, _ := lookupSockCgroup("tcp", netip.MustParseAddr("127.0.0.1"), 1234, nil); ok {
 		t.Fatalf("attributed cgroup %d without the cgroups map", id)
 	}
 	if !sockOwners.cgroupWarned {
