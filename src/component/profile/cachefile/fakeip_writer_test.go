@@ -201,20 +201,7 @@ func TestFakeIpWriterWithoutDatabase(t *testing.T) {
 // A failed commit is logged and its writes dropped, as FakeIpStore drops a
 // failed write; Sync must not wait for them.
 func TestFakeIpWriterCommitFailure(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cache.db")
-	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
-	require.NoError(t, err)
-	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists(bucketFakeip)
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte("kept.example"), []byte{198, 18, 0, 4})
-	}))
-	require.NoError(t, db.Close())
-	db, err = bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second, ReadOnly: true})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	db := openReadOnlyTestDB(t)
 
 	w := (&CacheFile{DB: db}).FakeIpWriter()
 	w.PutByHost("lost.example", netip.MustParseAddr("198.18.0.5"))
@@ -229,6 +216,52 @@ func TestFakeIpWriterCommitFailure(t *testing.T) {
 	got, ok = w.GetByHost("kept.example")
 	require.True(t, ok, "a failed flush must leave the entries")
 	require.Equal(t, netip.MustParseAddr("198.18.0.4"), got)
+}
+
+// A failed flush keeps pending writes queued rather than dropping them.
+func TestFakeIpWriterFailedFlushKeepsPendingWrites(t *testing.T) {
+	w := (&CacheFile{DB: openReadOnlyTestDB(t)}).FakeIpWriter()
+	ip := netip.MustParseAddr("198.18.0.5")
+	// Marked as running, the writer starts no commit goroutine, so the write
+	// is still pending when the flush runs.
+	w.mu.Lock()
+	w.running = true
+	w.mu.Unlock()
+	w.PutByHost("pending.example", ip)
+
+	require.Error(t, w.FlushFakeIP())
+	got, ok := w.GetByHost("pending.example")
+	require.True(t, ok, "the failed flush dropped a pending write")
+	require.Equal(t, ip, got)
+	w.mu.Lock()
+	require.Len(t, w.ops, 1)
+	w.mu.Unlock()
+
+	w.commitLoop() // read-only: the commit fails and drops the write
+	w.Sync()
+	_, ok = w.GetByHost("pending.example")
+	require.False(t, ok)
+}
+
+// openReadOnlyTestDB returns a read-only database whose fake-IP bucket maps
+// kept.example to 198.18.0.4; every write transaction on it fails.
+func openReadOnlyTestDB(t *testing.T) *bbolt.DB {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cache.db")
+	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(bucketFakeip)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("kept.example"), []byte{198, 18, 0, 4})
+	}))
+	require.NoError(t, db.Close())
+	db, err = bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second, ReadOnly: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	return db
 }
 
 // Shutdown waits for every writer, including those of pools a reload
