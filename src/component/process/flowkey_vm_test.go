@@ -89,6 +89,8 @@ func TestFlowRecordsPreferred(t *testing.T) {
 	for _, v := range []*wineFlowValue{alpha, beta} {
 		v.Status, v.Protocol, v.ServerTgid, v.ClientTgid = wineStatusKnown, unix.IPPROTO_TCP, 333, 334
 	}
+	alpha.SocketID, beta.SocketID = 41, 42
+	wineSockets := map[string]uint64{`C:\Games\alpha.exe`: 41, `C:\Games\beta.exe`: 42}
 	put(wineFlowsFd, unsafe.Pointer(&key), unsafe.Pointer(alpha))
 	k = flowKey(pasta)
 	put(winePeers, unsafe.Pointer(&k), unsafe.Pointer(beta))
@@ -129,6 +131,11 @@ func TestFlowRecordsPreferred(t *testing.T) {
 			_, path, ok := findWineProcess("tcp", source.Addr(), int(source.Port()), tc.peers)
 			if path != tc.wine || ok != (tc.wine != "") {
 				t.Errorf("Wine path = %q, %v; want %q", path, ok, tc.wine)
+			}
+			// The sender identity of UDP sessions reads the same records.
+			id := FindFlowOwner("tcp", source.Addr(), int(source.Port()), tc.peers...)
+			if id.Tgid != tc.tgid || id.WineSocket != wineSockets[tc.wine] {
+				t.Errorf("flow owner = %+v; want TGID %d, Wine socket %d", id, tc.tgid, wineSockets[tc.wine])
 			}
 		})
 	}

@@ -152,6 +152,30 @@ func (w *wineFlows) heartbeatAgeLocked() (time.Duration, bool) {
 // its publisher stopped beating, which leaves records unmaintained: a port
 // may have changed hands.
 func (w *wineFlows) lookup(key *sockOwnerKey, peers []netip.AddrPort, dir string) (value wineFlowValue, live, found bool) {
+	w.refreshIfStale(dir)
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if value, found = w.recordLocked(key, peers); !found {
+		return value, false, false
+	}
+	// The publisher writes host CLOCK_BOOTTIME; a beat from the future means
+	// another clock, so it proves nothing.
+	if age, ok := w.heartbeatAgeLocked(); ok {
+		live = age >= 0 && age < wineHeartbeatLimit
+	}
+	return value, live, true
+}
+
+// record returns the record of a flow as lookup does, without the
+// publisher's heartbeat.
+func (w *wineFlows) record(key *sockOwnerKey, peers []netip.AddrPort, dir string) (wineFlowValue, bool) {
+	w.refreshIfStale(dir)
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.recordLocked(key, peers)
+}
+
+func (w *wineFlows) refreshIfStale(dir string) {
 	w.mu.RLock()
 	stale := w.pinned.stale()
 	w.mu.RUnlock()
@@ -162,10 +186,12 @@ func (w *wineFlows) lookup(key *sockOwnerKey, peers []netip.AddrPort, dir string
 		}
 		w.mu.Unlock()
 	}
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+}
+
+// recordLocked looks up a flow's record with w.mu held for reading.
+func (w *wineFlows) recordLocked(key *sockOwnerKey, peers []netip.AddrPort) (value wineFlowValue, found bool) {
 	if w.flowsFd < 0 {
-		return value, false, false
+		return value, false
 	}
 	key.Netns = w.netns
 	// wine_egress writes a flow's wine_peer_flows record with its wine_flows
@@ -176,22 +202,13 @@ func (w *wineFlows) lookup(key *sockOwnerKey, peers []netip.AddrPort, dir string
 	// observer that does not publish wine_peer_flows.
 	if keys := flowKeys(*key, peers); w.peerFlowsFd >= 0 && len(keys) > 0 {
 		for _, k := range keys {
-			if found = lookupBPFMap(w.peerFlowsFd, &k, &value); found {
-				break
+			if lookupBPFMap(w.peerFlowsFd, &k, &value) {
+				return value, true
 			}
 		}
-		if !found {
-			return value, false, false
-		}
-	} else if !lookupBPFMap(w.flowsFd, key, &value) {
-		return value, false, false
+		return value, false
 	}
-	// The publisher writes host CLOCK_BOOTTIME; a beat from the future means
-	// another clock, so it proves nothing.
-	if age, ok := w.heartbeatAgeLocked(); ok {
-		live = age >= 0 && age < wineHeartbeatLimit
-	}
-	return value, live, true
+	return value, lookupBPFMap(w.flowsFd, key, &value)
 }
 
 // wineFlowsDir returns the directory of the Wine maps beside the configured

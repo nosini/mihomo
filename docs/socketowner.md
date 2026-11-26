@@ -85,6 +85,20 @@ only for an observer without `wine_peer_flows` or a connection without a known
 destination; otherwise a flow missing from `wine_peer_flows` has no Windows
 program, even when another socket's record on its source port names one.
 
+UDP sessions are keyed by their source address and port, as in upstream mihomo,
+so a socket keeps one route for every destination it sends to for as long as the
+session lasts (60 seconds after its last packet). With process lookup on
+(`find-process-mode` other than `off`) and rule mode, mihomo also reads every
+packet's recorded sender from the maps: the owning process and, for a Wine flow,
+the Windows program's socket. A packet from another sender, such as a process
+that reused the port while the session lasted, replaces the session, so its
+packets are matched against the rules again rather than leaving through the
+previous sender's route. Sockets of different processes sending from the same
+address and port at the same time, as `SO_REUSEADDR` and `SO_REUSEPORT` allow,
+replace each other's sessions, so replies on the replaced session are lost.
+These reads take a few map lookups per packet and never read `/proc`; without
+the maps, packets keep the session of the first sender.
+
 ## Flatpak apps
 
 Loaders that publish owner cgroups (feature bit 0 of `abi_version`, the

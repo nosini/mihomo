@@ -102,7 +102,12 @@ metadata those outbounds record is
 `patches/0005-flatpak-app-rule.patch` with `src/component/process/cgroup*.go`
 and `src/rules/common/flatpak_app.go`. `SYSTEMD-UNIT` rules and the
 `systemdUnit` metadata field are `patches/0006-systemd-unit-rule.patch` with
-`src/rules/common/systemd_unit.go`; they reuse that cgroup lookup.
+`src/rules/common/systemd_unit.go`; they reuse that cgroup lookup. The
+destination keys that tell apart sockets sharing a source port are
+`patches/0007-flow-destination.patch`, and UDP sessions that are replaced when
+another process sends from their address and port are
+`patches/0008-udp-session-owner.patch` with `src/tunnel/udpsession*.go` and
+`src/component/process/flowowner.go`.
 
 ## Releases
 

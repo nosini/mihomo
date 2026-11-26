@@ -95,3 +95,33 @@ func (m *sockOwnerMap) lookupFlowLocked(key sockOwnerKey, peers []netip.AddrPort
 	}
 	return value, false
 }
+
+func findFlowOwner(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) FlowOwner {
+	key, ok := newSockOwnerKey(network, ip, srcPort)
+	if !ok {
+		return FlowOwner{}
+	}
+	var id FlowOwner
+	var owner sockOwnerValue
+	if sockOwners.lookup(func(fd int, netns uint64) bool {
+		k := key
+		k.Netns = netns
+		if flow, ok := sockOwners.lookupFlowLocked(k, peers); ok {
+			owner = flow.owner()
+			return true
+		}
+		return lookupBPFMap(fd, &k, &owner)
+	}) {
+		id.Tgid, id.UID, id.BootNs = owner.Tgid, owner.UID, owner.BootNs
+	}
+	sockOwners.mu.RLock()
+	dir, enabled := wineFlowsDir(sockOwners.path)
+	sockOwners.mu.RUnlock()
+	if !enabled {
+		return id
+	}
+	if wine, ok := wineFlowMaps.record(&key, peers, dir); ok {
+		id.WineSocket, id.WineServer, id.WineClient, id.WineStatus = wine.SocketID, wine.ServerTgid, wine.ClientTgid, wine.Status
+	}
+	return id
+}

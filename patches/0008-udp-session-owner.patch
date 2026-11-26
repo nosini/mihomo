@@ -1,0 +1,168 @@
+diff --git a/component/nat/table.go b/component/nat/table.go
+index c74e6f88..95650a10 100644
+--- a/component/nat/table.go
++++ b/component/nat/table.go
+@@ -13,7 +13,13 @@ type Table struct {
+ }
+ 
+ type entry struct {
+-	PacketSender    C.PacketSender
++	PacketSender C.PacketSender
++	*localConns
++}
++
++// localConns are the sockets which write replies back to a local address. A
++// sender that replaces another on the same address keeps them.
++type localConns struct {
+ 	LocalUDPConnMap xsync.Map[string, *net.UDPConn]
+ 	LocalLockMap    xsync.Map[string, *sync.Cond]
+ }
+@@ -22,15 +28,55 @@ func (t *Table) GetOrCreate(key string, maker func() C.PacketSender) (C.PacketSe
+ 	item, loaded := t.mapping.LoadOrStoreFn(key, func() *entry {
+ 		return &entry{
+ 			PacketSender: maker(),
++			localConns:   &localConns{},
+ 		}
+ 	})
+ 	return item.PacketSender, loaded
+ }
+ 
++// Replace gives key a new sender from maker if it still has old, keeping its
++// local conns, or if it has none. created is false when another sender
++// replaced old first; actual is then that sender.
++func (t *Table) Replace(key string, old C.PacketSender, maker func() C.PacketSender) (actual C.PacketSender, created bool) {
++	item, _ := t.mapping.Compute(key, func(current *entry, loaded bool) (*entry, xsync.ComputeOp) {
++		switch {
++		case !loaded:
++			created = true
++			return &entry{PacketSender: maker(), localConns: &localConns{}}, xsync.UpdateOp
++		case current.PacketSender == old:
++			created = true
++			return &entry{PacketSender: maker(), localConns: current.localConns}, xsync.UpdateOp
++		}
++		return current, xsync.CancelOp
++	})
++	return item.PacketSender, created
++}
++
+ func (t *Table) Delete(key string) {
+ 	t.mapping.Delete(key)
+ }
+ 
++// DeleteFor removes key's entry if it still has sender and passes each of its
++// local conns to f. An entry whose sender was replaced is left to its new
++// sender, local conns included.
++func (t *Table) DeleteFor(key string, sender C.PacketSender, f func(key string, value *net.UDPConn) bool) bool {
++	var removed *entry
++	t.mapping.Compute(key, func(current *entry, loaded bool) (*entry, xsync.ComputeOp) {
++		if loaded && current.PacketSender == sender {
++			removed = current
++			return current, xsync.DeleteOp
++		}
++		return current, xsync.CancelOp
++	})
++	if removed == nil {
++		return false
++	}
++	if f != nil {
++		removed.LocalUDPConnMap.Range(f)
++	}
++	return true
++}
++
+ func (t *Table) GetForLocalConn(lAddr, rAddr string) *net.UDPConn {
+ 	entry, exist := t.getEntry(lAddr)
+ 	if !exist {
+diff --git a/tunnel/connection.go b/tunnel/connection.go
+index 3a66a76e..08e4cdb9 100644
+--- a/tunnel/connection.go
++++ b/tunnel/connection.go
+@@ -169,8 +169,13 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
+ 	defer func() {
+ 		sender.Close()
+ 		_ = pc.Close()
+-		closeAllLocalCoon(key)
+-		natTable.Delete(key)
++		// A session replaced by another sender's leaves the entry, and the
++		// local conns writing back to the same address, to the new one.
++		natTable.DeleteFor(key, sender, func(rAddr string, conn *net.UDPConn) bool {
++			conn.Close()
++			log.Debugln("Closing TProxy local conn... lAddr=%s rAddr=%s", key, rAddr)
++			return true
++		})
+ 	}()
+ 
+ 	for {
+@@ -207,16 +212,6 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
+ 	}
+ }
+ 
+-func closeAllLocalCoon(lAddr string) {
+-	natTable.RangeForLocalConn(lAddr, func(key string, value *net.UDPConn) bool {
+-		conn := value
+-
+-		conn.Close()
+-		log.Debugln("Closing TProxy local conn... lAddr=%s rAddr=%s", lAddr, key)
+-		return true
+-	})
+-}
+-
+ func handleSocket(inbound, outbound net.Conn) {
+ 	N.Relay(inbound, outbound)
+ }
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 689edd7e..87f1e9e9 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -463,13 +463,27 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 	}
+ 
+ 	key := packet.Key()
+-	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
++	owner := udpFlowOwner(metadata)
++	newSender := func() C.PacketSender {
+ 		sender := newPacketSender()
+ 		if sniffingEnable && snifferDispatcher.Enable() {
+-			return snifferDispatcher.UDPSniff(packet, sender)
++			return newUDPSession(snifferDispatcher.UDPSniff(packet, sender), owner)
+ 		}
+-		return sender
+-	})
++		return newUDPSession(sender, owner)
++	}
++	sender, loaded := natTable.GetOrCreate(key, newSender)
++	// The session's route was chosen for the sender of its first packet. A
++	// packet from another sender on the same address and port, such as a
++	// process reusing the port within the session's timeout, must not leave
++	// through it: replace the session, so that this packet is matched anew.
++	if session, ok := sender.(*udpSession); loaded && ok && session.owner != owner {
++		log.Debugln("[UDP] %s has another sender, opening a new session", key)
++		var created bool
++		if sender, created = natTable.Replace(key, session, newSender); created {
++			session.Close()
++		}
++		loaded = !created
++	}
+ 	if !loaded {
+ 		dial := func() (C.PacketConn, C.WriteBackProxy, error) {
+ 			originMetadata := metadata  // save origin metadata
+@@ -502,6 +516,10 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 			logMetadata(metadata, rule, rawPc)
+ 
+ 			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
++			if session, ok := sender.(*udpSession); ok && !session.attach(pc) {
++				_ = pc.Close()
++				return nil, nil, errors.New("replaced by another sender's session")
++			}
+ 
+ 			sender.AddMapping(originMetadata, dialMetadata)
+ 			oAddrPort := dialMetadata.AddrPort()
+@@ -515,7 +533,7 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 			pc, proxy, err := dial()
+ 			if err != nil {
+ 				sender.Close()
+-				natTable.Delete(key)
++				natTable.DeleteFor(key, sender, nil)
+ 				return
+ 			}
+ 			sender.Process(pc, proxy)

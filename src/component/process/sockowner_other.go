@@ -37,3 +37,8 @@ func findProcessNameTo(network string, ip netip.Addr, srcPort int, peers []netip
 func findCgroup(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (string, bool) {
 	return "", false
 }
+
+// Only Linux has the socket-owner maps.
+func findFlowOwner(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) FlowOwner {
+	return FlowOwner{}
+}
