@@ -147,8 +147,8 @@ func (w *wineFlows) heartbeatAgeLocked() (time.Duration, bool) {
 	return time.Duration(now.Nano() - int64(beat)), true
 }
 
-// lookup returns the record of a flow, given its key without the namespace,
-// preferring the record of its exact flow to one of peers. live is false if
+// lookup returns the record of a flow, given its key without the namespace and
+// the destinations its packets may carry, peers. live is false if
 // its publisher stopped beating, which leaves records unmaintained: a port
 // may have changed hands.
 func (w *wineFlows) lookup(key *sockOwnerKey, peers []netip.AddrPort, dir string) (value wineFlowValue, live, found bool) {
@@ -168,15 +168,22 @@ func (w *wineFlows) lookup(key *sockOwnerKey, peers []netip.AddrPort, dir string
 		return value, false, false
 	}
 	key.Netns = w.netns
-	found = false
-	if w.peerFlowsFd >= 0 {
-		for _, k := range flowKeys(*key, peers) {
+	// wine_egress writes a flow's wine_peer_flows record with its wine_flows
+	// one, from the same packet, so a flow whose destination misses the former
+	// is no Windows program's: a wine_flows record on its source port is
+	// another socket's, such as a pasta relay's to another peer. The
+	// source-keyed record answers only when no destination is known, or for an
+	// observer that does not publish wine_peer_flows.
+	if keys := flowKeys(*key, peers); w.peerFlowsFd >= 0 && len(keys) > 0 {
+		for _, k := range keys {
 			if found = lookupBPFMap(w.peerFlowsFd, &k, &value); found {
 				break
 			}
 		}
-	}
-	if !found && !lookupBPFMap(w.flowsFd, key, &value) {
+		if !found {
+			return value, false, false
+		}
+	} else if !lookupBPFMap(w.flowsFd, key, &value) {
 		return value, false, false
 	}
 	// The publisher writes host CLOCK_BOOTTIME; a beat from the future means
@@ -204,9 +211,9 @@ func wineFlowsDir(ownerPath string) (string, bool) {
 //
 // connect() lets sockets with different peers share an ephemeral port, and
 // under TUN every host socket has the same source address. The record of the
-// flow's exact destination is preferred; one keyed by the source alone, from
-// an observer without those or for a destination peers miss, can be another
-// socket's. Its TGIDs can't tell: a relayed record names the sandbox's
+// flow's exact destination decides when the observer publishes those; one keyed
+// by the source alone, used without them or without a destination, can be
+// another socket's. Its TGIDs can't tell: a relayed record names the sandbox's
 // wineserver and client, not the pasta which owns the socket.
 func findWineProcess(network string, ip netip.Addr, srcPort int, peers []netip.AddrPort) (name, path string, ok bool) {
 	key, ok := newSockOwnerKey(network, ip, srcPort)

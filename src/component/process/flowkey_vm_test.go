@@ -14,8 +14,12 @@ import (
 )
 
 // Pinned maps as a loader with conn_flows and an observer with
-// wine_peer_flows publish them: the record of the exact flow is preferred,
-// and the source-keyed records answer when there is none.
+// wine_peer_flows publish them: the record of the exact flow is preferred.
+// The source-keyed owner answers when there is none, but a source-keyed Wine
+// record only when no destination is known: wine_egress writes both Wine
+// records from the same packet, so a destination missing wine_peer_flows is
+// another socket's, even if the Wine flow's last packet left wine_flows naming
+// its program.
 func TestFlowRecordsPreferred(t *testing.T) {
 	dir := fmt.Sprintf("/sys/fs/bpf/mihomo-flow-test-%d", os.Getpid())
 	if err := os.Mkdir(dir, 0700); err != nil {
@@ -102,15 +106,20 @@ func TestFlowRecordsPreferred(t *testing.T) {
 		tgid  uint32
 		wine  string
 	}{
-		// The browser's own flow has its own owner record. With no Wine
-		// record for its destination, the source-keyed one still answers:
-		// that is the fallback's limit.
-		{"exact browser flow", []netip.AddrPort{librewolf}, 222, `C:\Games\alpha.exe`},
+		// The browser's own flow has its own owner record, and no Wine
+		// record for its destination: the relay's source-keyed one on the
+		// same port is not the browser's.
+		{"exact browser flow", []netip.AddrPort{librewolf}, 222, ""},
 		// The relay's flow has its own Wine record.
 		{"exact relay flow", []netip.AddrPort{pasta}, 111, `C:\Games\beta.exe`},
+		// Any of the destinations a flow may carry finds its record.
+		{"relay flow, second peer", []netip.AddrPort{netip.MustParseAddrPort("198.18.0.7:443"), pasta}, 111, `C:\Games\beta.exe`},
 		// Without a destination, the source-only records apply.
 		{"no destination", nil, 111, `C:\Games\alpha.exe`},
-		{"unknown destination", []netip.AddrPort{netip.MustParseAddrPort("198.18.0.7:443")}, 111, `C:\Games\alpha.exe`},
+		{"invalid destination", []netip.AddrPort{{}}, 111, `C:\Games\alpha.exe`},
+		// A destination with no record of either kind: the owner falls back
+		// to conn_owners, but the Wine record names another socket's program.
+		{"unknown destination", []netip.AddrPort{netip.MustParseAddrPort("198.18.0.7:443")}, 111, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			owner, ok := lookupSockOwner("tcp", source.Addr(), int(source.Port()), tc.peers)

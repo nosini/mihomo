@@ -78,8 +78,12 @@ packet's destination, and the Wine observer's `wine_peer_flows` does the same
 for Windows programs. mihomo looks up the destination of a connection's packets
 as they reached it, before fake-ip or the sniffer change it, and the inbound's
 own address, which is the destination a redirected packet carries. When neither
-has a record, it uses the source-only maps, which can still hold another
-socket's record for the same source port.
+has an owner record, it uses `conn_owners`, which can still hold another
+socket's owner for the same source port. The observer writes a flow's
+`wine_peer_flows` record with its `wine_flows` one, so mihomo reads `wine_flows`
+only for an observer without `wine_peer_flows` or a connection without a known
+destination; otherwise a flow missing from `wine_peer_flows` has no Windows
+program, even when another socket's record on its source port names one.
 
 ## Flatpak apps
 
