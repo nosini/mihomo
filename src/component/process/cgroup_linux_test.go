@@ -1,6 +1,7 @@
 package process
 
 import (
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -151,6 +152,18 @@ func TestCgroupNamesHost(t *testing.T) {
 	if err != nil || !ok || unix.Statfs(defaultCgroupRoot, &fs) != nil || fs.Type != cgroup2SuperMagic {
 		t.Skip("no cgroup v2 at", defaultCgroupRoot)
 	}
+	var rootSt unix.Stat_t
+	if err := unix.Stat(defaultCgroupRoot, &rootSt); err != nil {
+		t.Skip("cgroup v2 root not visible:", err)
+	}
+	if rootSt.Ino != 1 {
+		// A private cgroup namespace hides the host tree; the remaining
+		// assertions need the host cgroup v2 root.
+		if _, err := walkCgroups(defaultCgroupRoot); err == nil {
+			t.Fatal("walked a private cgroup namespace")
+		}
+		t.Skip("private cgroup namespace")
+	}
 	var st unix.Stat_t
 	if err := unix.Stat(filepath.Join(defaultCgroupRoot, own), &st); err != nil {
 		t.Skip("own cgroup not visible:", err)
@@ -173,12 +186,189 @@ func TestCgroupNamesHost(t *testing.T) {
 	if c.walkedAt.Equal(walked) {
 		t.Fatal("didn't walk again after the interval")
 	}
-	// An ID above every known one is of a newer cgroup: walk right away.
+	// An ID above every known one is of a newer cgroup: walk right away,
+	// then wait for the interval if it is still missing.
 	walked = c.walkedAt
 	if _, ok := c.path(1 << 62); ok {
 		t.Fatal("resolved a missing ID")
 	}
 	if c.walkedAt.Equal(walked) {
 		t.Fatal("didn't walk again for a newer ID")
+	}
+	walked = c.walkedAt
+	if _, ok := c.path(1 << 62); ok {
+		t.Fatal("resolved a missing ID")
+	}
+	if !c.walkedAt.Equal(walked) {
+		t.Fatal("walked again for a missing high ID within the interval")
+	}
+}
+
+// A failed walk is not retried for every lookup within the rewalk interval.
+func TestCgroupNamesRewalkThrottle(t *testing.T) {
+	walkErr := errors.New("cannot walk")
+	walks := 0
+	c := &cgroupNames{root: "/cgroup", walk: func(string) (map[uint64]string, error) {
+		walks++
+		return nil, walkErr
+	}}
+	for i := 0; i < 3; i++ {
+		if _, ok := c.path(42); ok {
+			t.Fatal("resolved an ID")
+		}
+	}
+	if walks != 1 {
+		t.Fatalf("walked %d times after an error, want 1", walks)
+	}
+	c.walkedAt = time.Now().Add(-cgroupRewalkInterval)
+	c.path(42)
+	if walks != 2 {
+		t.Fatalf("walked %d times after the interval, want 2", walks)
+	}
+}
+
+// A missing ID above every known one walks once, then waits for the interval
+// like any other ID below the new maximum.
+func TestCgroupNamesMissingHighID(t *testing.T) {
+	walks := 0
+	c := &cgroupNames{root: "/cgroup", walk: func(string) (map[uint64]string, error) {
+		walks++
+		return map[uint64]string{10: "/seen"}, nil
+	}}
+	if got, ok := c.path(10); !ok || got != "/seen" {
+		t.Fatalf("known cgroup: %q, %v", got, ok)
+	}
+	if _, ok := c.path(20); ok {
+		t.Fatal("resolved a missing ID")
+	}
+	if walks != 2 {
+		t.Fatalf("walks %d, want 2", walks)
+	}
+	if c.maxID != 20 {
+		t.Fatalf("maxID %d, want 20", c.maxID)
+	}
+	c.path(20)
+	if walks != 2 {
+		t.Fatalf("walked again for a missing high ID: %d", walks)
+	}
+}
+
+// A cgroup that a later walk no longer finds stays named, and the retained
+// paths stay bounded.
+func TestCgroupNamesRetainsRemoved(t *testing.T) {
+	walks := 0
+	c := &cgroupNames{root: "/cgroup", walk: func(string) (map[uint64]string, error) {
+		walks++
+		if walks == 1 {
+			return map[uint64]string{10: "/app/gone", 11: "/app/live"}, nil
+		}
+		return map[uint64]string{11: "/app/live"}, nil
+	}}
+	if got, ok := c.path(10); !ok || got != "/app/gone" {
+		t.Fatalf("first walk: %q, %v", got, ok)
+	}
+	if _, ok := c.path(20); ok {
+		t.Fatal("resolved a missing ID")
+	}
+	if got, ok := c.path(10); !ok || got != "/app/gone" {
+		t.Fatalf("removed cgroup after rewalk: %q, %v", got, ok)
+	}
+	if known, err := c.health(); known != 1 || err != nil {
+		t.Fatalf("health %d, %v; want 1, nil", known, err)
+	}
+}
+
+func TestCgroupNamesRemovedBounded(t *testing.T) {
+	first := make(map[uint64]string, cgroupRemovedLimit+100)
+	for id := uint64(1); id <= cgroupRemovedLimit+100; id++ {
+		first[id] = "/cgroup"
+	}
+	walks := 0
+	c := &cgroupNames{root: "/cgroup", walk: func(string) (map[uint64]string, error) {
+		walks++
+		if walks == 1 {
+			return first, nil
+		}
+		return map[uint64]string{}, nil
+	}}
+	if _, ok := c.path(cgroupRemovedLimit + 100); !ok {
+		t.Fatal("didn't see the first walk")
+	}
+	if _, ok := c.path(cgroupRemovedLimit + 200); ok {
+		t.Fatal("resolved a missing ID")
+	}
+	if got := len(c.removed); got != cgroupRemovedLimit {
+		t.Fatalf("retained %d removed cgroups, want %d", got, cgroupRemovedLimit)
+	}
+	if got := len(c.removedOrder); got != cgroupRemovedLimit {
+		t.Fatalf("removed order holds %d, want %d", got, cgroupRemovedLimit)
+	}
+}
+
+// cgroupfs errors are reported only once a rule needs cgroups.
+func TestCgroupNamesWarnsOnlyWhenWanted(t *testing.T) {
+	previous := cgroupLookupWanted.Load()
+	t.Cleanup(func() { cgroupLookupWanted.Store(previous) })
+	cgroupLookupWanted.Store(false)
+	walkErr := errors.New("permission denied")
+	c := &cgroupNames{root: "/cgroup", walk: func(string) (map[uint64]string, error) {
+		return nil, walkErr
+	}}
+	c.path(1)
+	if c.warned != "" {
+		t.Fatalf("warned %q without a rule", c.warned)
+	}
+	cgroupLookupWanted.Store(true)
+	c.path(1)
+	if c.warned != walkErr.Error() {
+		t.Fatalf("warned %q, want %q", c.warned, walkErr)
+	}
+}
+
+// A loader that advertises -exec-paths keeps cgroup names in BPF, so a failed
+// map still reads as BPF and no lookup falls back to cgroupfs.
+func TestCgroupPathsBPFWithoutMaps(t *testing.T) {
+	m := &sockOwnerMap{fd: 3, cgroupsFd: -1, pathsFd: -1, features: featureCgroupPaths, cgroupErr: "cgroup_paths: missing"}
+	if path, ok, usesMap := m.recordedCgroupPath(1); ok || path != "" || !usesMap {
+		t.Fatalf("recorded path %q, %v, %v; want empty, false, true", path, ok, usesMap)
+	}
+	previous := cgroupPaths
+	cgroupPaths = &cgroupNames{root: defaultCgroupRoot, walk: func(string) (map[uint64]string, error) {
+		t.Error("walked cgroupfs with -exec-paths advertised")
+		return nil, nil
+	}}
+	t.Cleanup(func() { cgroupPaths = previous })
+	health := m.cgroupHealth()
+	if health.Source != "bpf" || health.Available || health.MapError != m.cgroupErr {
+		t.Fatalf("health %+v", health)
+	}
+	if health.Root != "" || health.KnownCgroups != 0 {
+		t.Fatalf("health listed cgroupfs: %+v", health)
+	}
+}
+
+// Without conn_cgroups, a flow record's cgroup ID is not used even when
+// conn_flows is open, and cgroup unavailability is recorded.
+func TestLookupSockCgroupNeedsCgroupMap(t *testing.T) {
+	previous := sockOwners
+	previousWanted := cgroupLookupWanted.Load()
+	cgroupLookupWanted.Store(true)
+	t.Cleanup(func() {
+		sockOwners = previous
+		cgroupLookupWanted.Store(previousWanted)
+	})
+	sockOwners = &sockOwnerMap{
+		fd:        3,
+		cgroupsFd: -1,
+		flowsFd:   3,
+		features:  featureCgroupPaths,
+		cgroupErr: "cgroup_paths: missing",
+		pinned:    pinnedMapSet{checkedAt: time.Now()},
+	}
+	if id, ok := lookupSockCgroup("tcp", netip.MustParseAddr("127.0.0.1"), 1234, nil); ok {
+		t.Fatalf("attributed cgroup %d without the cgroups map", id)
+	}
+	if !sockOwners.cgroupWarned {
+		t.Fatal("did not note cgroup unavailability when cgroupsFd < 0")
 	}
 }

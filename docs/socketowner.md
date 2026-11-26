@@ -47,9 +47,11 @@ rules:
 ```
 
 A broad `PROCESS-*` rule for a relay matches every program behind it, so place
-rules refusing a Windows program before it. 32-bit clients have a name but no
-Windows path. The reader and observer are available on their respective `main`
-branches.
+rules refusing a Windows program before it. Under new-style WOW64, where a
+64-bit process hosts a 32-bit Windows program, 32-bit clients report a full
+Windows path like 64-bit ones; only old-style 32-bit-only Wine builds report a
+mapped file name with no Windows path. The reader and observer are available on
+their respective `main` branches.
 
 socketowner records host process IDs, so the reader only resolves process
 paths when mihomo runs in the initial PID namespace. In a nested PID namespace
@@ -111,15 +113,23 @@ rules:
   - FLATPAK-APP,org.jdownloader.JDownloader,PROXY
 ```
 
-`flatpak run` in a desktop session starts each app in a transient systemd scope,
-`app-flatpak-<app ID>-<instance>.scope`, with the app ID escaped as a unit name
-(`-` becomes `\x2d`). Older Flatpak versions used the unescaped ID and the
-process ID; both forms are recognised. Only the owner's own cgroup or its
-nearest ancestor named `app-flatpak-…` counts. When that name isn't a valid
-scope for a valid app ID, the app is unknown, and no component further up is
-tried. App IDs are compared exactly, as Flatpak does; a rule whose payload isn't
-a valid app ID is rejected when the configuration loads. The lookup runs where
-process lookup runs, so `find-process-mode: off` turns the rule off too.
+`flatpak run` in a desktop session starts each app in a transient systemd scope:
+`app-flatpak-<escaped app ID>-<instance>.scope` with Flatpak 1.11 and later,
+where the app ID is escaped as a unit name (`-` becomes `\x2d`), or
+`flatpak-<app ID>-<PID>.scope` with earlier Flatpak versions. Both forms are
+recognised. Only the owner's own cgroup or its nearest ancestor named like a
+Flatpak scope counts. When that name isn't a valid scope for a valid app ID,
+the app is unknown, and no component further up is tried. App IDs are compared
+exactly, as Flatpak does; a rule whose payload isn't a valid app ID is rejected
+when the configuration loads. The lookup runs where process lookup runs, so
+`find-process-mode: off` turns the rule off too.
+
+Processes launched through `flatpak-portal` (`flatpak-spawn --sandbox` or
+`--host`, including Zypak-wrapped Chromium and Electron sub-sandboxes) run in
+`flatpak-portal.service` rather than the app's scope, so `FLATPAK-APP` does not
+match them and `SYSTEMD-UNIT` reports `flatpak-portal.service`. Apps started
+with `flatpak run` without a reachable `systemd --user` session remain in the
+caller's cgroup and do not match `FLATPAK-APP`.
 
 Connections attributed this way show the cgroup in `cgroupPath`, relative to the
 cgroupfs root, and the app in `flatpakApp`, beside `process` and `processPath`
@@ -153,17 +163,32 @@ which unit that pasta runs in:
 | Started as | pasta | Unit |
 |---|---|---|
 | Quadlet `NAME.container` | one per container | `NAME.service` (pasta in its `runtime` cgroup) |
-| `systemd-run --user --unit=NAME podman run …` | one per container | `NAME.service` |
+| `systemd-run --user --unit=NAME podman run …` | one per container, while the command runs in the foreground | `NAME.service` |
 | `podman run` from a shell | one per container | `podman-<PID>.scope`, or the scope of the terminal it was started from, such as `vte-spawn-<UUID>.scope`; neither is named after the container |
 | Quadlet `NAME.pod` | one per pod, shared by its containers | `NAME-pod.service` |
 | `podman pod create` from a shell | one per pod, shared by its containers | `podman-<PID>.scope` |
-| `--network` naming a user-defined network | one shared by all such containers | `rootless-netns-<ID>.scope` |
+| `--network` naming a user-defined network | one shared by all of the user's containers on user-defined networks | `rootless-netns-<ID>.scope` |
 
 So a Quadlet container is routed by its service name, and the containers of a
-Quadlet pod together by the pod's service. Containers on a
-user-defined network share one pasta, and they can't be told apart this way.
-A container started from a shell has no stable unit name; to route it on its
-own, start it as a Quadlet or with `systemd-run --user --unit=NAME`.
+Quadlet pod together by the pod's service. All of a user's rootless containers
+on user-defined networks share one `rootless-netns-<ID>.scope` pasta, across
+every user-defined network, and they can't be told apart this way. A container
+started from a shell has no stable unit name; to route it on its own, start it
+as a Quadlet or with `systemd-run --user --unit=NAME`. The `systemd-run` form
+needs the command to run in the foreground, or the container's pasta to stay in
+`NAME.service` rather than detaching into a separate scope, so that pasta is
+owned by that service.
+
+Rootful containers on a bridge network leave the host through kernel forwarding
+and NAT rather than a per-container user process, so they have no `SYSTEMD-UNIT`
+attribution. A rootful `--network=host` container is owned by the container's
+own process in its cgroup and is attributed through that unit.
+
+In a host-networked container that runs systemd inside, such as a
+`Network=host` Quadlet with `--systemd=always` or a `systemd-nspawn` container,
+`SYSTEMD-UNIT` finds the nearest `.service` or `.scope` component, which is the
+inner unit rather than the outer container service.
+
 `SYSTEMD-UNIT` identifies any cooperative unit, not only containers.
 
 With `-exec-paths`, the loader also records the path of each cgroup its hooks
@@ -174,10 +199,13 @@ named. An ID missing there stays unknown.
 A loader without `-exec-paths` records IDs only. mihomo then resolves an ID by
 listing `/sys/fs/cgroup`, whose directory inode numbers are the IDs, so it needs
 to see the host's cgroupfs, outside any private cgroup namespace (the hardened
-service binds it read-only in `/proc` mode). It keeps the paths it found and
-lists the tree again for an ID it doesn't know: straight away for an ID newer
-than all known ones, at most once a second otherwise. A scope removed before it
-was ever seen can't be named, and the connection then has no app.
+service mounts it read-only via `ProtectControlGroups=yes`). A cgroup namespace
+whose `/sys/fs/cgroup` root inode is not 1 is rejected as unavailable. It keeps
+the paths it found and lists the tree again for an ID it doesn't know: straight
+away for an ID newer than all known ones, at most once a second otherwise.
+Cgroups seen before removal are retained in a bounded cache across rewalks, so a
+scope still resolves after it has ended; a scope removed before it was ever seen
+can't be named, and the connection then has no app.
 
 The owner's cgroup record is only used when it belongs to the owner record of
 the same connection, since the maps are evicted independently.
@@ -308,7 +336,7 @@ The fields:
   record match `WINE-PROCESS-*` rules as `wine-unknown`, and the counter below
   counts the lookups refused for that reason.
 - `cgroups.available` is true while connections can be attributed to cgroups
-  for `FLATPAK-APP`. `cgroups.mapOpen` says the loader's owner-cgroup map is
+  for `FLATPAK-APP` and `SYSTEMD-UNIT`. `cgroups.mapOpen` says the loader's owner-cgroup map is
   open and `cgroups.pathsMapOpen` its cgroup paths; `cgroups.mapError` says why
   they aren't while the socket-owner map is, such as a loader that doesn't
   publish them. `cgroups.source` is `bpf` when names come from those paths and

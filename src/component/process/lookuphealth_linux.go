@@ -132,10 +132,17 @@ func wineHealth(state wineState, age time.Duration, beatRead bool) WineHealth {
 	health.Stale = state == wineStateStale
 	if beatRead {
 		seconds := int64(age / time.Second)
+		if age < 0 && age%time.Second != 0 {
+			seconds--
+		}
 		health.HeartbeatAgeSeconds = &seconds
 	}
 	return health
 }
+
+// wineHealthOrigin gives noteWineHealth a monotonic clock, so a step of the
+// wall clock doesn't stall the samples.
+var wineHealthOrigin = time.Now()
 
 // noteWineHealth samples the Wine publication state from the lookup path, at
 // most once per wineHeartbeatLimit. The /process-lookup route samples on
@@ -143,11 +150,12 @@ func wineHealth(state wineState, age time.Duration, beatRead bool) WineHealth {
 // nothing running.
 func noteWineHealth(dir string) {
 	w := wineFlowMaps
+	now := int64(time.Since(wineHealthOrigin)) + 1
 	last := w.healthChecked.Load()
-	if time.Now().UnixNano()-last < int64(wineHeartbeatLimit) {
+	if last != 0 && now-last < int64(wineHeartbeatLimit) {
 		return
 	}
-	if !w.healthChecked.CompareAndSwap(last, time.Now().UnixNano()) {
+	if !w.healthChecked.CompareAndSwap(last, now) {
 		return
 	}
 	w.sampleHealth(dir)

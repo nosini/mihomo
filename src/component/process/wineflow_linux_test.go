@@ -1,7 +1,9 @@
 package process
 
 import (
+	"math"
 	"testing"
+	"time"
 	"unicode/utf16"
 	"unsafe"
 
@@ -90,3 +92,28 @@ func TestWineFlowsDir(t *testing.T) {
 	}
 }
 
+func TestHeartbeatAge(t *testing.T) {
+	if _, ok := heartbeatAge(0, int64(time.Second)); ok {
+		t.Fatal("a missing beat read as live")
+	}
+	if _, ok := heartbeatAge(1, -1); ok {
+		t.Fatal("a negative clock read as live")
+	}
+	for name, tc := range map[string]struct {
+		beat uint64
+		now  int64
+		want time.Duration
+	}{
+		"behind":        {beat: 100, now: 900, want: 800},
+		"same":          {beat: 900, now: 900, want: 0},
+		"ahead":         {beat: 900, now: 100, want: -800},
+		"huge ahead":    {beat: math.MaxUint64, now: 0, want: -math.MaxInt64},
+		"huge behind":   {beat: 1, now: math.MaxInt64, want: math.MaxInt64 - 1},
+		"large but now": {beat: math.MaxInt64, now: math.MaxInt64, want: 0},
+	} {
+		got, ok := heartbeatAge(tc.beat, tc.now)
+		if !ok || got != tc.want {
+			t.Errorf("%s: got %v, %v; want %v", name, got, ok, tc.want)
+		}
+	}
+}

@@ -1,6 +1,7 @@
 package process
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -675,16 +676,100 @@ func (m *sockOwnerMap) execPathLocked(owner sockOwnerValue) (string, error) {
 
 // readSockOwnerExe reads the executable of the recorded owner from /proc.
 //
-// It doesn't check that the process ID still belongs to the owner. mihomo
-// looks a flow up right after its first packet, so the owner would have to
-// exit and the whole PID space wrap around in between. Checking would mean
-// reading /proc/<pid>/stat of other users' processes, which hardened setups
-// deny together with environ and mem. The exec-path maps record start times
-// and don't have this problem.
+// The process ID must still belong to the owner: the start time from
+// /proc/<pid>/stat, in USER_HZ ticks since boot, is compared with the boot time
+// recorded in the owner. A process that started later reused the ID and is
+// reported as gone. Reading the link first and the stat second also covers a
+// process that replaces another between the two. Hardened SELinux policies may
+// allow readlink on exe without open on stat; a permission error on stat then
+// skips the check instead of discarding the executable.
 func readSockOwnerExe(owner sockOwnerValue) (string, error) {
-	exe, err := os.Readlink("/proc/" + strconv.FormatUint(uint64(owner.Tgid), 10) + "/exe")
-	if errors.Is(err, os.ErrNotExist) {
+	return readSockOwnerExeAt(owner, "/proc", os.Readlink, os.ReadFile)
+}
+
+func readSockOwnerExeAt(owner sockOwnerValue, proc string, readlink func(string) (string, error), readFile func(string) ([]byte, error)) (string, error) {
+	pid := strconv.FormatUint(uint64(owner.Tgid), 10)
+	exe, err := readlink(filepath.Join(proc, pid, "exe"))
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
 		return "", errSockOwnerGone
 	}
-	return exe, err
+	if err != nil {
+		return "", err
+	}
+	stat, err := readFile(filepath.Join(proc, pid, "stat"))
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
+			return exe, nil
+		}
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+			return "", errSockOwnerGone
+		}
+		return "", err
+	}
+	startTicks, err := parseProcStatStartTicks(stat)
+	if err != nil {
+		return "", fmt.Errorf("process %d stat: %w", owner.Tgid, err)
+	}
+	if !procStartMatchesOwner(startTicks, owner.BootNs, userHZ()) {
+		return "", errSockOwnerGone
+	}
+	return exe, nil
+}
+
+// parseProcStatStartTicks returns field 22 of /proc/<pid>/stat, the process
+// start time in USER_HZ ticks since boot. The comm field can contain spaces and
+// ')', so fields are counted after the last ')'.
+func parseProcStatStartTicks(stat []byte) (uint64, error) {
+	i := bytes.LastIndexByte(stat, ')')
+	if i < 0 {
+		return 0, errors.New("no comm field")
+	}
+	fields := strings.Fields(string(stat[i+1:]))
+	const starttimeIndex = 22 - 3 // fields after comm start with field 3
+	if len(fields) <= starttimeIndex {
+		return 0, fmt.Errorf("only %d fields after comm", len(fields))
+	}
+	ticks, err := strconv.ParseUint(fields[starttimeIndex], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("starttime: %w", err)
+	}
+	return ticks, nil
+}
+
+// procStartMatchesOwner reports whether a process that started at startTicks
+// can be the owner recorded at bootNs. A later start means the process ID was
+// reused; a process that started before the owner record is the same process.
+// One tick of slack covers the truncation of both values.
+func procStartMatchesOwner(startTicks, bootNs, clkTck uint64) bool {
+	ownerBootTicks := (bootNs/1e9)*clkTck + ((bootNs%1e9)*clkTck)/1e9
+	return startTicks <= ownerBootTicks+1
+}
+
+const atClkTck = 17
+
+var (
+	clkTckOnce sync.Once
+	clkTck     uint64
+)
+
+// userHZ returns USER_HZ, the clock ticks per second that /proc/<pid>/stat
+// uses, from the ELF auxiliary vector without cgo, or 100 if it is absent.
+func userHZ() uint64 {
+	clkTckOnce.Do(func() {
+		clkTck = 100
+		data, err := os.ReadFile("/proc/self/auxv")
+		if err != nil {
+			return
+		}
+		size := int(unsafe.Sizeof(uintptr(0)))
+		for off := 0; off+2*size <= len(data); off += 2 * size {
+			typ := *(*uintptr)(unsafe.Pointer(&data[off]))
+			val := *(*uintptr)(unsafe.Pointer(&data[off+size]))
+			if typ == atClkTck && val != 0 {
+				clkTck = uint64(val)
+				return
+			}
+		}
+	})
+	return clkTck
 }

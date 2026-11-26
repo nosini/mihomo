@@ -26,11 +26,13 @@ func WantCgroupLookup() {
 	cgroupLookupWanted.Store(true)
 }
 
-// The prefix and suffix of the transient scope flatpak run starts for an app:
-// app-flatpak-<app ID>-<instance>.scope.
+// The prefixes and suffix of the transient scopes flatpak run starts for an
+// app: app-flatpak-<app ID>-<instance>.scope, or flatpak-<app ID>-<PID>.scope
+// from earlier Flatpak versions.
 const (
-	flatpakScopePrefix = "app-flatpak-"
-	flatpakScopeSuffix = ".scope"
+	flatpakScopePrefix       = "app-flatpak-"
+	legacyFlatpakScopePrefix = "flatpak-"
+	flatpakScopeSuffix       = ".scope"
 )
 
 // FlatpakAppFromCgroupPath returns the Flatpak app ID of a cgroup path. Only
@@ -46,22 +48,25 @@ func FlatpakAppFromCgroupPath(path string) (string, bool) {
 		} else {
 			path = path[:i]
 		}
-		if strings.HasPrefix(name, flatpakScopePrefix) {
+		if strings.HasPrefix(name, flatpakScopePrefix) ||
+			(strings.HasPrefix(name, legacyFlatpakScopePrefix) && strings.HasSuffix(name, flatpakScopeSuffix)) {
 			return ParseFlatpakScope(name)
 		}
 	}
 	return "", false
 }
 
-// ParseFlatpakScope returns the app ID of a scope named by flatpak run. Since
-// Flatpak 1.11 that is app-flatpak-<escaped app ID>-<instance ID>.scope, with
-// the app ID escaped as a systemd unit name (a "-" becomes \x2d) and a decimal
-// instance ID; earlier versions put the unescaped app ID and the process ID
-// there. Both forms end in "-<digits>", which is split at the last "-".
+// ParseFlatpakScope returns the app ID of a scope named by flatpak run:
+// app-flatpak-<escaped app ID>-<instance ID>.scope from Flatpak 1.11 and later,
+// with the app ID escaped as a systemd unit name (a "-" becomes \x2d) and a
+// decimal instance ID, or flatpak-<app ID>-<PID>.scope from earlier versions.
+// Both forms end in "-<digits>", which is split at the last "-".
 func ParseFlatpakScope(name string) (string, bool) {
 	rest, ok := strings.CutPrefix(name, flatpakScopePrefix)
 	if !ok {
-		return "", false
+		if rest, ok = strings.CutPrefix(name, legacyFlatpakScopePrefix); !ok {
+			return "", false
+		}
 	}
 	if rest, ok = strings.CutSuffix(rest, flatpakScopeSuffix); !ok {
 		return "", false

@@ -51,12 +51,13 @@ func TestFlowRecordsPreferred(t *testing.T) {
 	wineSize := uint32(unsafe.Sizeof(wineFlowValue{}))
 	abi := create("abi_version", unix.BPF_MAP_TYPE_ARRAY, 4, 4, 2)
 	owners := create("conn_owners", unix.BPF_MAP_TYPE_LRU_HASH, ownerKeySize, uint32(unsafe.Sizeof(sockOwnerValue{})), 16)
+	cgroups := create(connCgroupsMap, unix.BPF_MAP_TYPE_LRU_HASH, ownerKeySize, uint32(unsafe.Sizeof(sockCgroupValue{})), 16)
 	flows := create(connFlowsMap, unix.BPF_MAP_TYPE_LRU_HASH, flowKeySize, uint32(unsafe.Sizeof(sockFlowValue{})), 16)
 	wineABI := create(wineABIMap, unix.BPF_MAP_TYPE_ARRAY, 4, 4, 2)
 	heartbeat := create(wineHeartbeatMap, unix.BPF_MAP_TYPE_ARRAY, 4, 8, 1)
 	wineFlowsFd := create(wineFlowsMap, unix.BPF_MAP_TYPE_LRU_HASH, ownerKeySize, wineSize, 16)
 	winePeers := create(winePeerFlowsMap, unix.BPF_MAP_TYPE_LRU_HASH, flowKeySize, wineSize, 16)
-	for slot, v := range []uint32{1, featureConnFlows} {
+	for slot, v := range []uint32{1, featureConnCgroups | featureConnFlows} {
 		slot := uint32(slot)
 		put(abi, unsafe.Pointer(&slot), unsafe.Pointer(&v))
 	}
@@ -78,10 +79,12 @@ func TestFlowRecordsPreferred(t *testing.T) {
 	flowKey := func(peer netip.AddrPort) sockFlowKey {
 		return flowKeys(key, []netip.AddrPort{peer})[0]
 	}
-	// conn_owners holds the relay, the last to send from the port; conn_flows
-	// also has the browser's flow to its own destination.
+	// conn_owners and conn_cgroups hold the relay, the last to send from the
+	// port; conn_flows also has the browser's flow to its own destination.
 	relayOwner := sockOwnerValue{Tgid: 111, UID: 1000, BootNs: 1}
 	put(owners, unsafe.Pointer(&key), unsafe.Pointer(&relayOwner))
+	relayCgroup := sockCgroupValue{Tgid: 111, BootNs: 1, CgroupID: 99}
+	put(cgroups, unsafe.Pointer(&key), unsafe.Pointer(&relayCgroup))
 	browser := sockFlowValue{Tgid: 222, UID: 1000, BootNs: 2, CgroupID: 77}
 	k := flowKey(librewolf)
 	put(flows, unsafe.Pointer(&k), unsafe.Pointer(&browser))

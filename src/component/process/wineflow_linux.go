@@ -2,6 +2,7 @@ package process
 
 import (
 	"fmt"
+	"math"
 	"net/netip"
 	"path/filepath"
 	"strings"
@@ -90,6 +91,7 @@ func (w *wineFlows) reset() {
 	// A changed map path makes the next sample a first observation, so it
 	// logs nothing.
 	w.healthState.Store(int32(wineStateUnknown))
+	w.healthChecked.Store(0)
 }
 
 func (w *wineFlows) openLocked(dir string) error {
@@ -144,7 +146,28 @@ func (w *wineFlows) heartbeatAgeLocked() (time.Duration, bool) {
 	if !lookupBPFMap(w.heartbeatFd, &slot, &beat) || unix.ClockGettime(unix.CLOCK_BOOTTIME, &now) != nil {
 		return 0, false
 	}
-	return time.Duration(now.Nano() - int64(beat)), true
+	return heartbeatAge(beat, now.Nano())
+}
+
+// heartbeatAge returns how long before now the heartbeat beat was written. ok
+// is false for a missing beat or a negative clock. A beat after now yields a
+// negative age without wrapping.
+func heartbeatAge(beat uint64, now int64) (time.Duration, bool) {
+	if beat == 0 || now < 0 {
+		return 0, false
+	}
+	if beat <= uint64(now) {
+		diff := uint64(now) - beat
+		if diff > math.MaxInt64 {
+			diff = math.MaxInt64
+		}
+		return time.Duration(diff), true
+	}
+	ahead := beat - uint64(now)
+	if ahead > math.MaxInt64 {
+		ahead = math.MaxInt64
+	}
+	return -time.Duration(ahead), true
 }
 
 // lookup returns the record of a flow, given its key without the namespace and

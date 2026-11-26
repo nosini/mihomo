@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"testing"
 	"unsafe"
 
@@ -110,6 +111,65 @@ func TestIsInitialPidNamespace(t *testing.T) {
 	} {
 		if got := isInitialPidNamespace(link); got != want {
 			t.Errorf("%q: got %v, want %v", link, got, want)
+		}
+	}
+}
+
+func TestParseProcStatStartTicks(t *testing.T) {
+	// comm can contain spaces and parentheses; starttime is field 22.
+	stat := "123 (foo (bar) ) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987 20 21\n"
+	got, err := parseProcStatStartTicks([]byte(stat))
+	if err != nil || got != 987 {
+		t.Fatalf("got %d, %v; want 987", got, err)
+	}
+	for name, stat := range map[string]string{
+		"no comm":    "123 1 2 3",
+		"short":      "123 (foo) S 1 2 3",
+		"not a tick": "123 (foo) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 x 20",
+	} {
+		if _, err := parseProcStatStartTicks([]byte(stat)); err == nil {
+			t.Errorf("%s: parsed %q", name, stat)
+		}
+	}
+}
+
+func TestReadSockOwnerExeCurrentProcess(t *testing.T) {
+	var now unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &now); err != nil {
+		t.Fatal(err)
+	}
+	owner := sockOwnerValue{Tgid: uint32(os.Getpid()), BootNs: uint64(now.Nano())}
+	exe, err := readSockOwnerExe(owner)
+	if err != nil || exe == "" {
+		t.Fatalf("own process: %q, %v", exe, err)
+	}
+	// A process that started later than the owner record reused the ID.
+	owner.BootNs = 1
+	if _, err := readSockOwnerExe(owner); !errors.Is(err, errSockOwnerGone) {
+		t.Fatalf("reused PID: got %v, want %v", err, errSockOwnerGone)
+	}
+}
+
+func TestReadSockOwnerExeStatErrors(t *testing.T) {
+	owner := sockOwnerValue{Tgid: 42}
+	readlink := func(string) (string, error) { return "/bin/foo", nil }
+	for name, tc := range map[string]struct {
+		statErr error
+		want    string
+		wantErr error
+	}{
+		"eacces": {statErr: unix.EACCES, want: "/bin/foo"},
+		"eperm":  {statErr: unix.EPERM, want: "/bin/foo"},
+		"enoent": {statErr: unix.ENOENT, wantErr: errSockOwnerGone},
+	} {
+		readFile := func(string) ([]byte, error) { return nil, tc.statErr }
+		got, err := readSockOwnerExeAt(owner, "/proc", readlink, readFile)
+		if got != tc.want || (tc.wantErr == nil) != (err == nil) {
+			t.Errorf("%s: got %q, %v; want %q, %v", name, got, err, tc.want, tc.wantErr)
+			continue
+		}
+		if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+			t.Errorf("%s: got %v, want %v", name, err, tc.wantErr)
 		}
 	}
 }

@@ -10,6 +10,12 @@ func TestParseFlatpakScope(t *testing.T) {
 		`app-flatpak-org.example.Some_App2-0.scope`:                "org.example.Some_App2",
 		// Earlier versions: unescaped app ID, process ID.
 		`app-flatpak-org.example.My-App-12345.scope`: "org.example.My-App",
+		`flatpak-org.example.App-12345.scope`:        "org.example.App",
+		`flatpak-org.example.My-App-12345.scope`:     "org.example.My-App",
+		`flatpak-bad-1.scope`:                        "", // two elements only
+		`flatpak-org.example.App.scope`:              "", // no instance
+		`flatpak-org.example.App-12a.scope`:          "",
+		`flatpak-org.example.App-1.service`:          "",
 		`app-flatpak-test.App-123.scope`:             "", // two elements only
 		`app-flatpak-org.example.App.scope`:          "", // no instance
 		`app-flatpak-org.example.App-.scope`:         "",
@@ -39,6 +45,13 @@ func TestFlatpakAppFromCgroupPath(t *testing.T) {
 		// A child cgroup of the scope belongs to the app.
 		user + `app-flatpak-org.example.App-7.scope/sub`:        "org.example.App",
 		user + `app-flatpak-org.example.App-7.scope/sub/deeper`: "org.example.App",
+		// Earlier Flatpak scopes use the flatpak- prefix.
+		user + `flatpak-org.example.App-12345.scope`:     "org.example.App",
+		user + `flatpak-org.example.App-12345.scope/sub`: "org.example.App",
+		user + `flatpak-org.example.My-App-12345.scope`:  "org.example.My-App",
+		user + `flatpak-bad-1.scope`:                     "",
+		// A non-scope unit with the prefix is not a Flatpak scope.
+		user + `flatpak-portal.service`: "",
 		// Not a Flatpak scope.
 		user + `app-gnome-org.gnome.Terminal-4242.scope`: "",
 		user + `app-org.example.App-7.scope`:             "",
@@ -52,6 +65,7 @@ func TestFlatpakAppFromCgroupPath(t *testing.T) {
 		user + `my-app-flatpak-org.example.App-7.scope`:                                   "",
 		user + `app-flatpak-org.example.App-7.scope.d/x`:                                  "",
 		`/app-flatpak-org.example.App-7.scope`:                                            "org.example.App",
+		`/flatpak-org.example.App-7.scope`:                                                "org.example.App",
 	} {
 		got, ok := FlatpakAppFromCgroupPath(path)
 		if ok != (want != "") || got != want {

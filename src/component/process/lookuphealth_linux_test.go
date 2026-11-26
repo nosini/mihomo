@@ -86,6 +86,10 @@ func TestWineHealthSnapshot(t *testing.T) {
 	if !health.Stale || health.HeartbeatAgeSeconds == nil || *health.HeartbeatAgeSeconds != -90 {
 		t.Fatalf("beat ahead of the clock: %+v", health)
 	}
+	health = wineHealth(wineStateStale, -500*time.Millisecond, true)
+	if !health.Stale || health.HeartbeatAgeSeconds == nil || *health.HeartbeatAgeSeconds != -1 {
+		t.Fatalf("sub-second beat ahead: %+v", health)
+	}
 }
 
 // swapLookups replaces the lookup globals for a test and restores them.
@@ -268,6 +272,14 @@ func TestNoteWineHealth(t *testing.T) {
 	wine.reset()
 	if got := wineState(wine.healthState.Load()); got != wineStateUnknown {
 		t.Fatalf("state after reset %d, want unknown", got)
+	}
+	if got := wine.healthChecked.Load(); got != 0 {
+		t.Fatalf("health check after reset %d, want 0", got)
+	}
+	// The reset also allows an immediate sample.
+	noteWineHealth(dir)
+	if wine.healthChecked.Load() == 0 {
+		t.Fatal("didn't sample immediately after reset")
 	}
 }
 

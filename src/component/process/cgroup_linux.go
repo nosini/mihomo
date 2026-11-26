@@ -27,6 +27,9 @@ const (
 	cgroupRewalkInterval  = time.Second
 	cgroupWalkDepthLimit  = 64
 	cgroupWalkBufferBytes = 32 << 10
+	// cgroupRemovedLimit bounds the paths kept for cgroups a rewalk no
+	// longer finds.
+	cgroupRemovedLimit = 4096
 )
 
 // sockCgroupValue is the cgroup published for a connection, with the owner it
@@ -93,8 +96,9 @@ func (m *sockOwnerMap) openCgroupMapLocked() {
 func (m *sockOwnerMap) recordedCgroupPath(id uint64) (path string, ok, usesMap bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	usesMap = m.pathsFd >= 0 || m.features&featureCgroupPaths != 0
 	if m.pathsFd < 0 {
-		return "", false, false
+		return "", false, usesMap
 	}
 	var v cgroupPathValue
 	if !lookupBPFMap(m.pathsFd, &id, &v) {
@@ -133,16 +137,18 @@ func lookupSockCgroup(network string, ip netip.Addr, srcPort int, peers []netip.
 	// fn runs with m.mu held for reading.
 	found := m.lookup(func(fd int, netns uint64) bool {
 		key.Netns = netns
+		// Without the owner-cgroup map, no record can be attributed, even
+		// when a flow record carries a cgroup ID.
+		if m.cgroupsFd < 0 {
+			unavailable = true
+			return false
+		}
 		// A flow record holds its owner's cgroup, written with it.
 		if flow, ok := m.lookupFlowLocked(key, peers); ok {
 			cg.CgroupID = flow.CgroupID
 			return flow.Tgid != 0 && flow.CgroupID != 0
 		}
 		if !lookupBPFMap(fd, &key, &owner) || owner.Tgid == 0 {
-			return false
-		}
-		if m.cgroupsFd < 0 {
-			unavailable = true
 			return false
 		}
 		return lookupBPFMap(m.cgroupsFd, &key, &cg) && cg.belongsTo(owner)
@@ -183,16 +189,24 @@ func findCgroup(network string, ip netip.Addr, srcPort int, peers []netip.AddrPo
 // since, and is looked for in a new walk straight away. Other missing IDs are
 // mostly of cgroups removed before that walk; they are looked for again at
 // most once per cgroupRewalkInterval, which also covers a cgroup created in a
-// directory while the walk was past it. A cgroup removed before a walk finds
-// it can't be named and comes out unknown.
+// directory while the walk was past it. Paths of cgroups a later walk no
+// longer finds are retained, up to cgroupRemovedLimit, so a cgroup removed
+// after it was seen is still named. A cgroup removed before a walk finds it
+// can't be named and comes out unknown.
 type cgroupNames struct {
-	mu       sync.Mutex
-	root     string
-	byID     map[uint64]string
-	maxID    uint64
-	walkedAt time.Time
-	err      error
-	warned   string
+	mu      sync.Mutex
+	root    string
+	byID    map[uint64]string
+	removed map[uint64]string
+	// removedOrder evicts the oldest retained paths once removed exceeds
+	// cgroupRemovedLimit.
+	removedOrder []uint64
+	maxID        uint64
+	walkedAt     time.Time
+	err          error
+	warned       string
+	// walk lists cgroupfs; it is walkCgroups unless a test replaces it.
+	walk func(string) (map[uint64]string, error)
 }
 
 var cgroupPaths = &cgroupNames{root: defaultCgroupRoot}
@@ -200,31 +214,78 @@ var cgroupPaths = &cgroupNames{root: defaultCgroupRoot}
 func (c *cgroupNames) path(id uint64) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if p, ok := c.byID[id]; ok {
+	if p, ok := c.lookupLocked(id); ok {
 		return p, true
 	}
-	if id <= c.maxID && time.Since(c.walkedAt) < cgroupRewalkInterval {
+	if !c.walkedAt.IsZero() && time.Since(c.walkedAt) < cgroupRewalkInterval && (c.err != nil || id <= c.maxID) {
+		if c.err != nil {
+			c.warnLocked()
+		}
 		return "", false
 	}
 	c.walkLocked()
-	p, ok := c.byID[id]
+	if p, ok := c.lookupLocked(id); ok {
+		return p, true
+	}
+	if c.err == nil && id > c.maxID {
+		c.maxID = id
+	}
+	return "", false
+}
+
+// lookupLocked returns a path for id from the last walk or from the retained
+// removed cgroups.
+func (c *cgroupNames) lookupLocked(id uint64) (string, bool) {
+	if p, ok := c.byID[id]; ok {
+		return p, true
+	}
+	p, ok := c.removed[id]
 	return p, ok
+}
+
+// warnLocked logs a walk error once, when a rule needs cgroups.
+func (c *cgroupNames) warnLocked() {
+	if c.err == nil || !cgroupLookupWanted.Load() {
+		return
+	}
+	if text := c.err.Error(); text != c.warned {
+		c.warned = text
+		log.Warnln("[Process] Can't read cgroup names from %s: %v", c.root, c.err)
+	}
 }
 
 func (c *cgroupNames) walkLocked() {
 	c.walkedAt = time.Now()
-	byID, err := walkCgroups(c.root)
+	walk := c.walk
+	if walk == nil {
+		walk = walkCgroups
+	}
+	byID, err := walk(c.root)
 	c.err = err
 	if err != nil {
-		if text := err.Error(); text != c.warned {
-			c.warned = text
-			log.Warnln("[Process] Can't read cgroup names from %s: %v", c.root, err)
-		}
+		c.warnLocked()
 		return
 	}
 	c.warned = ""
+	if c.removed == nil {
+		c.removed = map[uint64]string{}
+	}
+	for oldID, oldPath := range c.byID {
+		if _, ok := byID[oldID]; ok {
+			continue
+		}
+		if _, ok := c.removed[oldID]; ok {
+			continue
+		}
+		c.removed[oldID] = oldPath
+		c.removedOrder = append(c.removedOrder, oldID)
+	}
+	for len(c.removed) > cgroupRemovedLimit {
+		oldest := c.removedOrder[0]
+		c.removedOrder = c.removedOrder[1:]
+		delete(c.removed, oldest)
+	}
 	c.byID = byID
-	c.maxID = 0
 	for id := range byID {
 		if id > c.maxID {
 			c.maxID = id
@@ -262,6 +323,10 @@ func walkCgroups(root string) (map[uint64]string, error) {
 	if err := unix.Fstat(fd, &st); err != nil {
 		unix.Close(fd)
 		return nil, err
+	}
+	if st.Ino != 1 {
+		unix.Close(fd)
+		return nil, fmt.Errorf("%s is in a private cgroup namespace, not the host cgroup v2 root", root)
 	}
 	byID := map[uint64]string{st.Ino: "/"}
 	buf := make([]byte, cgroupWalkBufferBytes)
@@ -327,14 +392,15 @@ func walkCgroupDir(fd int, path string, depth int, buf []byte, byID map[uint64]s
 // mapsHealth, which has refreshed the publication point.
 func (m *sockOwnerMap) cgroupHealth() CgroupHealth {
 	m.mu.RLock()
+	usesBPFPaths := m.pathsFd >= 0 || m.features&featureCgroupPaths != 0
 	health := CgroupHealth{MapOpen: m.cgroupsFd >= 0, PathsMapOpen: m.pathsFd >= 0}
 	if m.fd >= 0 && m.cgroupsFd < 0 {
 		health.MapError = m.cgroupErr
 	}
 	m.mu.RUnlock()
-	if health.PathsMapOpen {
+	if usesBPFPaths {
 		health.Source = "bpf"
-		health.Available = health.MapOpen
+		health.Available = health.MapOpen && health.PathsMapOpen
 		return health
 	}
 	health.Source = "cgroupfs"
