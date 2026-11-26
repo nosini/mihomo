@@ -1,8 +1,10 @@
 package fakeip
 
 import (
+	"fmt"
 	"net/netip"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -74,6 +76,16 @@ func TestPoolCachefileLookupDoesNotWaitForDisk(t *testing.T) {
 	require.Equal(t, "second.example", host)
 
 	require.NoError(t, tx.Rollback())
+	reloaded.StoreState()
+	raw := (&cachefile.CacheFile{DB: db}).FakeIpStore()
+	for host, ip := range map[string]netip.Addr{"first.example": first.ip, "second.example": second} {
+		got, ok := raw.GetByHost(host)
+		require.True(t, ok, host)
+		require.Equal(t, ip, got, host)
+		gotHost, ok := raw.GetByIP(ip)
+		require.True(t, ok, host)
+		require.Equal(t, host, gotHost)
+	}
 }
 
 // StoreState runs at shutdown: the allocation state and every mapping before
@@ -96,4 +108,49 @@ func TestPoolCachefileStoreStateCommits(t *testing.T) {
 	host, ok := raw.GetByIP(ip)
 	require.True(t, ok)
 	require.Equal(t, "kept.example", host)
+}
+
+// StoreState and FlushFakeIP run while DNS queries allocate fake IPs. They
+// must hold the pool lock: run with -race. Afterwards every name must map
+// both ways, so no flush split a Lookup's two writes.
+func TestPoolCachefileStateAndFlushDuringLookups(t *testing.T) {
+	ipnet := netip.MustParsePrefix("198.18.0.0/24")
+	pool := newWriterTestPool(t, openWriterTestDB(t), ipnet)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				pool.Lookup(fmt.Sprintf("g%d-%d.example", g, i%50))
+			}
+		}(g)
+	}
+	for i := 0; i < 50; i++ {
+		pool.StoreState()
+		if i%5 == 0 {
+			require.NoError(t, pool.FlushFakeIP())
+		}
+	}
+	close(stop)
+	wg.Wait()
+	for g := 0; g < 4; g++ {
+		for i := 0; i < 50; i++ {
+			host := fmt.Sprintf("g%d-%d.example", g, i)
+			ip, ok := pool.store.GetByHost(host)
+			if !ok {
+				continue
+			}
+			back, ok := pool.LookBack(ip)
+			require.True(t, ok, host)
+			require.Equal(t, host, back)
+		}
+	}
+	pool.StoreState()
 }

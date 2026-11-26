@@ -15,6 +15,9 @@ import (
 // the pool lock, so waiting for the disk there would stall every new hostname
 // and every connection to a fake IP behind each commit.
 //
+// Pending entries are keyed like the bucket: host names and raw IP bytes
+// share one key space, so reads give what the committed bucket will hold.
+//
 // There is one writer per database and bucket. Pools built on a config reload
 // share it with the pool they replace and see its pending writes.
 type FakeIpWriter struct {
@@ -27,8 +30,7 @@ type FakeIpWriter struct {
 	mu      sync.Mutex
 	settled *sync.Cond
 	ops     []fakeIpOp
-	hosts   map[string]pendingFakeIp
-	ips     map[netip.Addr]pendingFakeHost
+	pending map[string]pendingFakeIpKey
 	queued  uint64 // sequence number of the last queued write
 	done    uint64 // writes up to this number are committed or dropped
 	running bool   // a commit goroutine is active
@@ -37,26 +39,19 @@ type FakeIpWriter struct {
 type fakeIpOpKind uint8
 
 const (
-	fakeIpPutHost fakeIpOpKind = iota
-	fakeIpPutIP
+	fakeIpPut fakeIpOpKind = iota
 	fakeIpDelIP
 )
 
 type fakeIpOp struct {
-	kind fakeIpOpKind
-	seq  uint64
-	host string
-	ip   netip.Addr
+	kind  fakeIpOpKind
+	seq   uint64
+	key   []byte
+	value []byte
 }
 
-type pendingFakeIp struct {
-	ip      netip.Addr
-	deleted bool
-	seq     uint64
-}
-
-type pendingFakeHost struct {
-	host    string
+type pendingFakeIpKey struct {
+	value   []byte
 	deleted bool
 	seq     uint64
 }
@@ -81,6 +76,20 @@ func (c *CacheFile) FakeIpWriter6() *FakeIpWriter {
 	return fakeIpWriterFor(c.FakeIpStore6())
 }
 
+// SyncFakeIpWriters waits until every writer has committed the writes queued
+// before the call, including writers of pools a config reload has dropped.
+func SyncFakeIpWriters() {
+	fakeIpWriters.Lock()
+	writers := make([]*FakeIpWriter, 0, len(fakeIpWriters.m))
+	for _, w := range fakeIpWriters.m {
+		writers = append(writers, w)
+	}
+	fakeIpWriters.Unlock()
+	for _, w := range writers {
+		w.Sync()
+	}
+}
+
 func fakeIpWriterFor(store *FakeIpStore) *FakeIpWriter {
 	key := fakeIpWriterKey{store.DB, string(store.bucketName)}
 	fakeIpWriters.Lock()
@@ -88,85 +97,103 @@ func fakeIpWriterFor(store *FakeIpStore) *FakeIpWriter {
 	if w, ok := fakeIpWriters.m[key]; ok {
 		return w
 	}
-	w := &FakeIpWriter{
-		store: store,
-		hosts: map[string]pendingFakeIp{},
-		ips:   map[netip.Addr]pendingFakeHost{},
-	}
+	w := &FakeIpWriter{store: store, pending: map[string]pendingFakeIpKey{}}
 	w.settled = sync.NewCond(&w.mu)
 	fakeIpWriters.m[key] = w
 	return w
 }
 
-func (w *FakeIpWriter) GetByHost(host string) (netip.Addr, bool) {
+// lookup returns the value of key as the committed bucket will hold it.
+func (w *FakeIpWriter) lookup(key []byte) (value []byte, ok bool) {
 	w.mu.Lock()
-	p, ok := w.hosts[host]
+	p, pending := w.pending[string(key)]
 	w.mu.Unlock()
-	if ok {
-		return p.ip, !p.deleted
+	if pending {
+		return p.value, !p.deleted
 	}
-	return w.store.GetByHost(host)
+	if w.store.DB == nil {
+		return nil, false
+	}
+	_ = w.store.DB.View(func(t *bbolt.Tx) error {
+		if bucket := t.Bucket(w.store.bucketName); bucket != nil {
+			if v := bucket.Get(key); v != nil {
+				value, ok = append([]byte{}, v...), true
+			}
+		}
+		return nil
+	})
+	return value, ok
+}
+
+func (w *FakeIpWriter) GetByHost(host string) (netip.Addr, bool) {
+	if v, ok := w.lookup([]byte(host)); ok {
+		return netip.AddrFromSlice(v)
+	}
+	return netip.Addr{}, false
 }
 
 func (w *FakeIpWriter) GetByIP(ip netip.Addr) (string, bool) {
-	w.mu.Lock()
-	p, ok := w.ips[ip]
-	w.mu.Unlock()
-	if ok {
-		return p.host, !p.deleted
+	if v, ok := w.lookup(ip.AsSlice()); ok {
+		return string(v), true
 	}
-	return w.store.GetByIP(ip)
+	return "", false
 }
 
 func (w *FakeIpWriter) PutByHost(host string, ip netip.Addr) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.store.DB == nil {
-		return
-	}
-	if host == "" {
-		// bbolt refuses empty keys; fail now, as FakeIpStore.PutByHost does,
-		// rather than show the entry until its commit fails.
-		log.Warnln("[CacheFile] write cache to %s failed: %s", w.store.DB.Path(), bbolt.ErrKeyRequired.Error())
-		return
-	}
-	seq := w.nextLocked()
-	w.hosts[host] = pendingFakeIp{ip: ip, seq: seq}
-	w.queueLocked(fakeIpOp{kind: fakeIpPutHost, seq: seq, host: host, ip: ip})
+	w.put([]byte(host), ip.AsSlice())
 }
 
 func (w *FakeIpWriter) PutByIP(ip netip.Addr, host string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.store.DB == nil {
-		return
-	}
-	seq := w.nextLocked()
-	w.ips[ip] = pendingFakeHost{host: host, seq: seq}
-	w.queueLocked(fakeIpOp{kind: fakeIpPutIP, seq: seq, host: host, ip: ip})
+	w.put(ip.AsSlice(), []byte(host))
 }
 
-// DelByIP removes ip and the host key it names, like FakeIpStore.DelByIP.
-func (w *FakeIpWriter) DelByIP(ip netip.Addr) {
+func (w *FakeIpWriter) put(key, value []byte) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.store.DB == nil {
 		return
 	}
-	// The committed transaction reads the host from the bucket after every
+	if len(key) == 0 {
+		// bbolt refuses empty keys; fail now, as FakeIpStore does, rather
+		// than show the entry until its commit fails.
+		log.Warnln("[CacheFile] write cache to %s failed: %s", w.store.DB.Path(), bbolt.ErrKeyRequired.Error())
+		return
+	}
+	value = append([]byte{}, value...)
+	seq := w.nextLocked()
+	w.pending[string(key)] = pendingFakeIpKey{value: value, seq: seq}
+	w.queueLocked(fakeIpOp{kind: fakeIpPut, seq: seq, key: key, value: value})
+}
+
+// DelByIP removes ip and the key its value names, like FakeIpStore.DelByIP.
+func (w *FakeIpWriter) DelByIP(ip netip.Addr) {
+	key := ip.AsSlice()
+	if w.store.DB == nil || len(key) == 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	// The committed transaction reads the value from the bucket after every
 	// earlier write; the pending entries plus the database give the same view.
-	host, ok := "", false
-	if p, pending := w.ips[ip]; pending {
-		host, ok = p.host, !p.deleted
+	var host []byte
+	if p, pending := w.pending[string(key)]; pending {
+		if !p.deleted {
+			host = p.value
+		}
 	} else {
-		host, ok = w.store.GetByIP(ip)
+		_ = w.store.DB.View(func(t *bbolt.Tx) error {
+			if bucket := t.Bucket(w.store.bucketName); bucket != nil {
+				host = append([]byte{}, bucket.Get(key)...)
+			}
+			return nil
+		})
 	}
 	seq := w.nextLocked()
-	w.ips[ip] = pendingFakeHost{deleted: true, seq: seq}
-	if ok && host != "" {
-		w.hosts[host] = pendingFakeIp{deleted: true, seq: seq}
+	w.pending[string(key)] = pendingFakeIpKey{deleted: true, seq: seq}
+	if len(host) > 0 {
+		w.pending[string(host)] = pendingFakeIpKey{deleted: true, seq: seq}
 	}
-	w.queueLocked(fakeIpOp{kind: fakeIpDelIP, seq: seq, ip: ip})
+	w.queueLocked(fakeIpOp{kind: fakeIpDelIP, seq: seq, key: key})
 }
 
 // Sync waits until every write queued before the call is committed.
@@ -179,20 +206,31 @@ func (w *FakeIpWriter) Sync() {
 	}
 }
 
-// FlushFakeIP drops pending writes and deletes the bucket.
+// FlushFakeIP deletes the bucket, then drops pending writes. If the delete
+// fails, the pending writes stay queued.
 func (w *FakeIpWriter) FlushFakeIP() error {
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.store.DB == nil {
+		return nil
+	}
+	// Still holding mu: readers must not see old entries between deleting
+	// the bucket and dropping the pending writes.
+	if err := w.store.DB.Update(func(t *bbolt.Tx) error {
+		if t.Bucket(w.store.bucketName) == nil {
+			return nil
+		}
+		return t.DeleteBucket(w.store.bucketName)
+	}); err != nil {
+		return err
+	}
 	w.ops = nil
-	w.hosts = map[string]pendingFakeIp{}
-	w.ips = map[netip.Addr]pendingFakeHost{}
+	w.pending = map[string]pendingFakeIpKey{}
 	w.done = w.queued
 	w.settled.Broadcast()
-	// Still holding mu: readers must not see old entries between dropping
-	// the pending writes and deleting the bucket.
-	return w.store.FlushFakeIP()
+	return nil
 }
 
 func (w *FakeIpWriter) nextLocked() uint64 {
@@ -230,14 +268,15 @@ func (w *FakeIpWriter) commitLoop() {
 
 		w.mu.Lock()
 		last := ops[len(ops)-1].seq
-		for host, p := range w.hosts {
-			if p.seq <= last {
-				delete(w.hosts, host)
-			}
-		}
-		for ip, p := range w.ips {
-			if p.seq <= last {
-				delete(w.ips, ip)
+		if last == w.queued {
+			// Nothing newer is pending; a fresh map also gives back the
+			// memory a burst made the old one grow to.
+			w.pending = map[string]pendingFakeIpKey{}
+		} else {
+			for key, p := range w.pending {
+				if p.seq <= last {
+					delete(w.pending, key)
+				}
 			}
 		}
 		if last > w.done {
@@ -249,9 +288,9 @@ func (w *FakeIpWriter) commitLoop() {
 	}
 }
 
-// applyFakeIpOps writes ops in order. A write bbolt rejects (an empty host
-// key, for one) is logged and skipped without aborting the others, as
-// FakeIpStore's separate batched writes would.
+// applyFakeIpOps writes ops in order. A write bbolt rejects is logged and
+// skipped without aborting the others, as FakeIpStore's separate batched
+// writes would.
 func applyFakeIpOps(t *bbolt.Tx, bucketName []byte, ops []fakeIpOp) error {
 	bucket, err := t.CreateBucketIfNotExists(bucketName)
 	if err != nil {
@@ -259,14 +298,11 @@ func applyFakeIpOps(t *bbolt.Tx, bucketName []byte, ops []fakeIpOp) error {
 	}
 	for _, op := range ops {
 		switch op.kind {
-		case fakeIpPutHost:
-			err = bucket.Put([]byte(op.host), op.ip.AsSlice())
-		case fakeIpPutIP:
-			err = bucket.Put(op.ip.AsSlice(), []byte(op.host))
+		case fakeIpPut:
+			err = bucket.Put(op.key, op.value)
 		case fakeIpDelIP:
-			addr := op.ip.AsSlice()
-			host := append([]byte(nil), bucket.Get(addr)...)
-			err = bucket.Delete(addr)
+			host := append([]byte{}, bucket.Get(op.key)...)
+			err = bucket.Delete(op.key)
 			if err == nil && len(host) > 0 {
 				err = bucket.Delete(host)
 			}

@@ -48,10 +48,17 @@ func TestFakeIpWriterMatchesStore(t *testing.T) {
 	want := ref.FakeIpStore()
 	got := openTestCache(t).FakeIpWriter()
 
-	hosts := []string{"a.example", "b.example", "c.example", "d.example", "e.example", ""}
-	var ips []netip.Addr
-	for i := 1; i <= 6; i++ {
-		ips = append(ips, netip.AddrFrom4([4]byte{198, 18, 0, byte(i)}))
+	// Host names and raw IP bytes share the bucket's key space: "docs" and
+	// "data" are also the keys of 100.111.99.115 and 100.97.116.97. The
+	// invalid address has an empty key, which bbolt refuses.
+	hosts := []string{"a.example", "b.example", "c.example", "docs", "data", ""}
+	ips := []netip.Addr{
+		netip.MustParseAddr("100.111.99.115"),
+		netip.MustParseAddr("100.97.116.97"),
+		netip.MustParseAddr("100.64.0.4"),
+		netip.MustParseAddr("100.64.0.5"),
+		netip.MustParseAddr("100.64.0.6"),
+		{},
 	}
 	rng := rand.New(rand.NewSource(1))
 	for step := 0; step < 1500; step++ {
@@ -135,8 +142,7 @@ func TestFakeIpWriterDoesNotWaitForCommit(t *testing.T) {
 	require.Equal(t, host, gotHost)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	require.Empty(t, w.hosts)
-	require.Empty(t, w.ips)
+	require.Empty(t, w.pending)
 }
 
 func TestFakeIpWriterFlush(t *testing.T) {
@@ -176,15 +182,142 @@ func TestFakeIpWriterSharedPerBucket(t *testing.T) {
 	require.NotSame(t, cache.FakeIpWriter(), openTestCache(t).FakeIpWriter())
 }
 
+// Without a cache file every write is dropped, as with FakeIpStore, and a
+// flush has nothing to delete.
 func TestFakeIpWriterWithoutDatabase(t *testing.T) {
 	w := (&CacheFile{}).FakeIpWriter()
 	ip := netip.MustParseAddr("198.18.0.4")
 	w.PutByHost("x.example", ip)
 	w.PutByIP(ip, "x.example")
-	w.DelByIP(ip)
-	w.Sync()
 	_, ok := w.GetByHost("x.example")
 	require.False(t, ok)
+	_, ok = w.GetByIP(ip)
+	require.False(t, ok)
+	w.DelByIP(ip)
+	w.Sync()
+	require.NoError(t, w.FlushFakeIP())
+}
+
+// A failed commit is logged and its writes dropped, as FakeIpStore drops a
+// failed write; Sync must not wait for them.
+func TestFakeIpWriterCommitFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
+	require.NoError(t, err)
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists(bucketFakeip)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("kept.example"), []byte{198, 18, 0, 4})
+	}))
+	require.NoError(t, db.Close())
+	db, err = bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second, ReadOnly: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	w := (&CacheFile{DB: db}).FakeIpWriter()
+	w.PutByHost("lost.example", netip.MustParseAddr("198.18.0.5"))
+	w.DelByIP(netip.MustParseAddr("198.18.0.4"))
+	w.Sync()
+	_, ok := w.GetByHost("lost.example")
+	require.False(t, ok)
+	got, ok := w.GetByHost("kept.example")
+	require.True(t, ok)
+	require.Equal(t, netip.MustParseAddr("198.18.0.4"), got)
+	require.Error(t, w.FlushFakeIP())
+	got, ok = w.GetByHost("kept.example")
+	require.True(t, ok, "a failed flush must leave the entries")
+	require.Equal(t, netip.MustParseAddr("198.18.0.4"), got)
+}
+
+// Shutdown waits for every writer, including those of pools a reload
+// dropped.
+func TestSyncFakeIpWriters(t *testing.T) {
+	caches := []*CacheFile{openTestCache(t), openTestCache(t)}
+	var txs []*bbolt.Tx
+	for i, cache := range caches {
+		tx, err := cache.DB.Begin(true)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = tx.Rollback() })
+		txs = append(txs, tx)
+		cache.FakeIpWriter().PutByHost(fmt.Sprintf("w%d.example", i), netip.MustParseAddr("198.18.0.4"))
+		cache.FakeIpWriter6().PutByHost(fmt.Sprintf("w%d.example", i), netip.MustParseAddr("fdfe:dcba::4"))
+	}
+	synced := make(chan struct{})
+	go func() {
+		SyncFakeIpWriters()
+		close(synced)
+	}()
+	select {
+	case <-synced:
+		t.Fatal("returned before the writes were committed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	for _, tx := range txs {
+		require.NoError(t, tx.Rollback())
+	}
+	select {
+	case <-synced:
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not return after the commits")
+	}
+	for i, cache := range caches {
+		_, ok := cache.FakeIpStore().GetByHost(fmt.Sprintf("w%d.example", i))
+		require.True(t, ok)
+		_, ok = cache.FakeIpStore6().GetByHost(fmt.Sprintf("w%d.example", i))
+		require.True(t, ok)
+	}
+}
+
+// Overlapping writes, deletes, flushes and syncs from many goroutines; run
+// with -race. Afterwards the writer must read exactly what the bucket holds.
+func TestFakeIpWriterConcurrentMixed(t *testing.T) {
+	cache := openTestCache(t)
+	w := cache.FakeIpWriter()
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(g)))
+			for i := 0; i < 300; i++ {
+				host := fmt.Sprintf("h%d.example", rng.Intn(16))
+				ip := netip.AddrFrom4([4]byte{198, 18, 0, byte(rng.Intn(16))})
+				switch rng.Intn(20) {
+				case 0:
+					_ = w.FlushFakeIP()
+				case 1:
+					w.Sync()
+				case 2, 3, 4:
+					w.DelByIP(ip)
+				case 5, 6, 7, 8:
+					w.GetByHost(host)
+					w.GetByIP(ip)
+				default:
+					w.PutByIP(ip, host)
+					w.PutByHost(host, ip)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	w.Sync()
+	contents := bucketContents(t, cache.DB, bucketFakeip)
+	for i := 0; i < 16; i++ {
+		host := fmt.Sprintf("h%d.example", i)
+		ip, ok := w.GetByHost(host)
+		v, inDB := contents[host]
+		require.Equal(t, inDB, ok, host)
+		if ok {
+			require.Equal(t, v, string(ip.AsSlice()), host)
+		}
+		a := netip.AddrFrom4([4]byte{198, 18, 0, byte(i)})
+		h, ok := w.GetByIP(a)
+		v, inDB = contents[string(a.AsSlice())]
+		require.Equal(t, inDB, ok, a.String())
+		require.Equal(t, v, h, a.String())
+	}
 }
 
 func TestFakeIpWriterConcurrent(t *testing.T) {

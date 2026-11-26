@@ -118,7 +118,12 @@ in its own batched transaction while holding the pool lock, so every new
 hostname waited at least 10 ms per write, and connections to fake IPs queued
 behind those writes. Writes shared by pools on the same database and bucket
 go through one writer, so a pool created on a config reload sees the writes
-its predecessor has not yet committed; `StoreState` waits for them at shutdown.
+its predecessor has not yet committed. At shutdown the patch stops the DNS
+server first, so no fake IP is handed out after its pool's state is saved,
+then waits for every writer, including those of pools a reload dropped.
+Pending entries are keyed like the bucket, where host names and raw IP bytes
+share one key space. Pending writes are not capped: if commits stall, they
+accumulate in memory, where upstream would block DNS answers instead.
 
 ## Releases
 
