@@ -77,11 +77,13 @@ and with TUN every local socket has the same source address. A map keyed by the
 source alone then holds whichever of those sockets sent last. Loaders that
 publish `conn_flows` (feature bit 2 of `abi_version`) also key each owner by the
 packet's destination, and the Wine observer's `wine_peer_flows` does the same
-for Windows programs. mihomo looks up the destination of a connection's packets
-as they reached it, before fake-ip or the sniffer change it, and the inbound's
-own address, which is the destination a redirected packet carries. When neither
-has an owner record, it uses `conn_owners`, which can still hold another
-socket's owner for the same source port. The observer writes a flow's
+for Windows programs. For TUN and TPROXY inbounds, mihomo looks up the destination of a connection's
+packets as they reached it, before fake-ip or the sniffer change it; for proxy,
+tunnel and redirect inbounds (including TUN `auto-redirect`), it looks up the
+inbound listener's own address, which is the destination the client's packets
+carry. When `conn_flows` has no record for that destination, it falls back to
+`conn_owners`, which can still hold another socket's owner for the same source
+port. The observer writes a flow's
 `wine_peer_flows` record with its `wine_flows` one, so mihomo reads `wine_flows`
 only for an observer without `wine_peer_flows` or a connection without a known
 destination; otherwise a flow missing from `wine_peer_flows` has no Windows
