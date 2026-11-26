@@ -52,6 +52,14 @@ func (s *udpSession) attach(pc C.PacketConn) bool {
 	return true
 }
 
+// isClosed reports whether the session was closed, by another sender's
+// session replacing it.
+func (s *udpSession) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 // Close stops the session's sender and closes its outbound connection, which
 // ends the goroutine writing replies back.
 func (s *udpSession) Close() {

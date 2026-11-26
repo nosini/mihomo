@@ -2,6 +2,8 @@ package tunnel
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -10,8 +12,12 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/net/packet"
+	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/process"
+	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
+	snifferTypes "github.com/metacubex/mihomo/constant/sniffer"
 )
 
 // testOutbound opens a real loopback UDP socket for every session, so that
@@ -20,9 +26,18 @@ type testOutbound struct {
 	C.Proxy
 	mu    sync.Mutex
 	conns []*net.UDPConn
+	// dials counts ListenPacketContext calls; fail makes them fail.
+	dials atomic.Int32
+	fail  atomic.Bool
 }
 
 func (o *testOutbound) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
+	o.dials.Add(1)
+	if o.fail.Load() {
+		// Wrapped as a loopback rejection, which stops handleUDPConn's
+		// dial retries, so a failing dial is a single call.
+		return nil, fmt.Errorf("test outbound: %w", loopback.ErrReject)
+	}
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return nil, err
@@ -42,6 +57,10 @@ func (*testPacketConn) ProviderChains() C.Chain                       { return n
 func (*testPacketConn) AppendToChains(C.ProxyAdapter)                 {}
 func (*testPacketConn) RemoteDestination() string                     { return "" }
 func (*testPacketConn) ResolveUDP(context.Context, *C.Metadata) error { return nil }
+
+// Name answers the dial-failure log line, which the embedded nil C.Proxy
+// cannot.
+func (*testOutbound) Name() string { return "DIRECT" }
 
 // countingRule counts the rule matches, one per resolveMetadata, and matches
 // nothing, so DIRECT is used.
@@ -213,5 +232,172 @@ func TestUDPSessionUnknownSender(t *testing.T) {
 	}
 	if from[0] != from[1] || rule.matches.Load() != 1 {
 		t.Errorf("sources %v with %d matches, want one session", from, rule.matches.Load())
+	}
+}
+
+// A replacement whose dial fails holds the entry with the TPROXY local conns
+// of its address, so its teardown closes them instead of leaking the
+// write-back sockets with their reader goroutines.
+func TestUDPSessionFailedDialClosesLocalConns(t *testing.T) {
+	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	destination := server.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	outbound := &testOutbound{}
+	rule := &countingRule{}
+	oldProxies, oldProviders := UpdateProxies(map[string]C.Proxy{"DIRECT": outbound}, nil)
+	oldRules, oldSubRules, oldRuleProviders := UpdateRules([]C.Rule{rule}, nil, nil)
+	oldStatus := status.Load()
+	OnRunning()
+	owners := map[string]process.FlowOwner{
+		"alpha": {Tgid: 100, UID: 1000, BootNs: 1},
+		"beta":  {Tgid: 200, UID: 1000, BootNs: 2},
+	}
+	var sender atomic.Value
+	findFlowOwner = func(string, netip.Addr, int, ...netip.AddrPort) process.FlowOwner {
+		return owners[sender.Load().(string)]
+	}
+	defer func() {
+		findFlowOwner = process.FindFlowOwner
+		UpdateProxies(oldProxies, oldProviders)
+		UpdateRules(oldRules, oldSubRules, oldRuleProviders)
+		status.Store(oldStatus)
+	}()
+
+	source := netip.MustParseAddrPort("198.18.0.2:5002")
+	key := source.String() // the packet adapter's NAT key is its local address
+	replies := make(chan []byte, 16)
+	send := func(from, data string) {
+		sender.Store(from)
+		metadata := &C.Metadata{NetWork: C.UDP, Type: C.SOCKS5,
+			SrcIP: source.Addr(), SrcPort: source.Port(), DstIP: destination.Addr(), DstPort: destination.Port()}
+		handleUDPConn(C.NewPacketAdapter(&testPacket{data: []byte(data), source: source, replies: replies}, metadata))
+	}
+
+	send("alpha", "a1")
+	buf := make([]byte, 64)
+	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if n, err := server.Read(buf); err != nil || string(buf[:n]) != "a1" {
+		t.Fatalf("first packet %q, %v", buf[:n], err)
+	}
+
+	// A local conn writing replies back to the session's source, as the
+	// TPROXY inbound records one.
+	local, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !natTable.AddForLocalConn(key, "1.2.3.4:443", local) {
+		t.Fatal("no entry to hold the local conn")
+	}
+
+	outbound.fail.Store(true)
+	send("beta", "b1")
+
+	_ = local.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := local.Read(buf); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("read on the local conn: %v, want %v", err, net.ErrClosed)
+	}
+	if conn := natTable.GetForLocalConn(key, "1.2.3.4:443"); conn != nil {
+		t.Error("the entry is still in the NAT table")
+	}
+}
+
+// quicInitialDatagram builds a QUIC v1 long-header Initial with an
+// undecryptable payload: the sniffer keeps waiting for more fragments
+// instead of deciding, as one does behind a client that has more to send.
+func quicInitialDatagram() []byte {
+	datagram := []byte{
+		0xc0,                   // long header, fixed bit, Initial
+		0x00, 0x00, 0x00, 0x01, // version 1
+		0x08, // destination connection ID length
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x00, // source connection ID length
+		0x00, // token length
+		0x18, // packet length
+	}
+	return append(datagram, make([]byte, 0x18)...)
+}
+
+// A session closed while its sniffer waits for more packets is not matched
+// against the rules again and not dialed: the packet that replaced it owns the
+// route, and the dead session leaves through nothing.
+func TestUDPSessionClosedDuringSniffNotDialed(t *testing.T) {
+	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	destination := server.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	outbound := &testOutbound{}
+	rule := &countingRule{}
+	oldProxies, oldProviders := UpdateProxies(map[string]C.Proxy{"DIRECT": outbound}, nil)
+	oldRules, oldSubRules, oldRuleProviders := UpdateRules([]C.Rule{rule}, nil, nil)
+	oldStatus := status.Load()
+	OnRunning()
+	owners := map[string]process.FlowOwner{
+		"alpha": {Tgid: 100, UID: 1000, BootNs: 1},
+		"beta":  {Tgid: 200, UID: 1000, BootNs: 2},
+	}
+	var sender atomic.Value
+	findFlowOwner = func(string, netip.Addr, int, ...netip.AddrPort) process.FlowOwner {
+		return owners[sender.Load().(string)]
+	}
+	oldDispatcher, oldSniffing := snifferDispatcher, sniffingEnable
+	dispatcher, err := sniffer.NewDispatcher(&sniffer.Config{
+		Enable: true,
+		Sniffers: map[snifferTypes.Type]sniffer.SnifferConfig{
+			snifferTypes.QUIC: {Ports: utils.IntRanges[uint16]{utils.NewRange[uint16](destination.Port(), destination.Port())}},
+		},
+		ParsePureIp: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	UpdateSniffer(dispatcher)
+	defer func() {
+		snifferDispatcher = oldDispatcher
+		sniffingEnable = oldSniffing
+		findFlowOwner = process.FindFlowOwner
+		UpdateProxies(oldProxies, oldProviders)
+		UpdateRules(oldRules, oldSubRules, oldRuleProviders)
+		status.Store(oldStatus)
+	}()
+
+	source := netip.MustParseAddrPort("198.18.0.3:5003")
+	replies := make(chan []byte, 16)
+	send := func(from string, data []byte) {
+		sender.Store(from)
+		metadata := &C.Metadata{NetWork: C.UDP, Type: C.SOCKS5,
+			SrcIP: source.Addr(), SrcPort: source.Port(), DstIP: destination.Addr(), DstPort: destination.Port()}
+		handleUDPConn(C.NewPacketAdapter(&testPacket{data: data, source: source, replies: replies}, metadata))
+	}
+
+	send("alpha", quicInitialDatagram())
+	// Another sender replaces the session while its sniff waits.
+	send("beta", []byte("b1"))
+
+	buf := make([]byte, 64)
+	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if n, err := server.Read(buf); err != nil || string(buf[:n]) != "b1" {
+		t.Fatalf("replacement packet %q, %v", buf[:n], err)
+	}
+	// A dial the closed session might still start would reach the outbound
+	// right after its sniff returned, so wait out that window.
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); {
+		if dials := outbound.dials.Load(); dials > 1 {
+			t.Fatalf("%d dial attempts, want 1", dials)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := rule.matches.Load(); n != 1 {
+		t.Errorf("%d rule matches, want 1", n)
+	}
+	if n := outbound.dials.Load(); n != 1 {
+		t.Errorf("%d dial attempts, want 1", n)
 	}
 }
