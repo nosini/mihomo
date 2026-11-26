@@ -170,9 +170,10 @@ index 44ad93ac..22dd290e 100644
 +		}
 +
 +		dstPort := binary.BigEndian.Uint16(response.DstPort[:])
++		unconnected := dst.IsUnspecified() && dstPort == 0
 +
 +		if len(validPeers) == 0 {
-+			if srcMatch {
++			if srcMatch && (isUDP || !unconnected) {
 +				return response.UID, response.INode, nil
 +			}
 +			// Without peers, a socket on the wildcard address is a
@@ -187,7 +188,6 @@ index 44ad93ac..22dd290e 100644
  
 -		// this is the one we want
 -		break
-+		unconnected := dst.IsUnspecified() && dstPort == 0
 +		switch {
 +		case !isUDP:
 +			// For TCP, an entry with an unspecified destination is a

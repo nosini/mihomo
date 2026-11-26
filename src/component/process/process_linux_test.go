@@ -216,10 +216,22 @@ func TestMatchInetDiagResponses(t *testing.T) {
 	t.Run("TCP listener loses to established socket in either order", func(t *testing.T) {
 		listener := diagMessage(unix.AF_INET, src, netip.IPv4Unspecified(), 5000, 0, 1008, 888)
 		established := diagMessage(unix.AF_INET, src, netip.MustParseAddr("9.9.9.9"), 5000, 80, 1009, 999)
-		for _, msgs := range [][]netlink.Message{{listener, established}, {established, listener}} {
-			uid, inode, err := matchInetDiagResponses(msgs, src, 5000, []netip.AddrPort{peerA}, false)
-			if err != nil || uid != 1009 || inode != 999 {
-				t.Fatalf("got uid=%d inode=%d err=%v; want 1009, 999, nil", uid, inode, err)
+		for _, peers := range [][]netip.AddrPort{{peerA}, nil} {
+			for _, msgs := range [][]netlink.Message{{listener, established}, {established, listener}} {
+				uid, inode, err := matchInetDiagResponses(msgs, src, 5000, peers, false)
+				if err != nil || uid != 1009 || inode != 999 {
+					t.Fatalf("peers=%v: got uid=%d inode=%d err=%v; want 1009, 999, nil", peers, uid, inode, err)
+				}
+			}
+		}
+	})
+
+	t.Run("TCP listener alone returns ErrNotFound", func(t *testing.T) {
+		listener := diagMessage(unix.AF_INET, src, netip.IPv4Unspecified(), 5000, 0, 1008, 888)
+		for _, peers := range [][]netip.AddrPort{{peerA}, nil} {
+			uid, inode, err := matchInetDiagResponses([]netlink.Message{listener}, src, 5000, peers, false)
+			if !errors.Is(err, ErrNotFound) || uid != 0 || inode != 0 {
+				t.Fatalf("peers=%v: got uid=%d inode=%d err=%v; want 0, 0, ErrNotFound", peers, uid, inode, err)
 			}
 		}
 	})
