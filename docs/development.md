@@ -110,6 +110,16 @@ another process sends from their address and port are
 `patches/0008-udp-session-owner.patch` with `src/tunnel/udpsession*.go` and
 `src/component/process/flowowner.go`.
 
+Fake-IP pools with `store-fake-ip` keep their writes in memory and commit them
+to `cache.db` in the background: `patches/0009-fakeip-write-behind.patch` with
+`src/component/profile/cachefile/fakeip_writer*.go` and
+`src/component/fakeip/cachefile_writer_test.go`. Upstream writes each mapping
+in its own batched transaction while holding the pool lock, so every new
+hostname waited at least 10 ms per write, and connections to fake IPs queued
+behind those writes. Writes shared by pools on the same database and bucket
+go through one writer, so a pool created on a config reload sees the writes
+its predecessor has not yet committed; `StoreState` waits for them at shutdown.
+
 ## Releases
 
 The openSUSE packages in

@@ -15,6 +15,9 @@ This build of [Mihomo](https://github.com/MetaCubeX/mihomo) adds:
   process lookup is working and where its answers come from.
 - Nameservers for direct outbounds, queried through the outbound itself, with
   the answering server shown in the connection list.
+- Fake-IP answers that don't wait for the disk with `profile.store-fake-ip`
+  on. New mappings are saved to `cache.db` in the background, so new hostnames
+  and connections no longer queue behind each write.
 
 Connection statistics and TLS hostname discovery stay on their own branches and
 are not part of `main`.

@@ -1,0 +1,43 @@
+diff --git a/component/fakeip/cachefile.go b/component/fakeip/cachefile.go
+index 2ebb0d58..62573b1f 100644
+--- a/component/fakeip/cachefile.go
++++ b/component/fakeip/cachefile.go
+@@ -7,7 +7,7 @@ import (
+ )
+ 
+ type cachefileStore struct {
+-	cache *cachefile.FakeIpStore
++	cache *cachefile.FakeIpWriter
+ }
+ 
+ // GetByHost implements store.GetByHost
+@@ -50,10 +50,15 @@ func (c *cachefileStore) FlushFakeIP() error {
+ 	return c.cache.FlushFakeIP()
+ }
+ 
++// Sync waits until earlier writes are committed to the cache file.
++func (c *cachefileStore) Sync() {
++	c.cache.Sync()
++}
++
+ func newCachefileStore(cache *cachefile.CacheFile, prefix netip.Prefix) *cachefileStore {
+ 	if prefix.Addr().Is6() {
+-		return &cachefileStore{cache.FakeIpStore6()}
++		return &cachefileStore{cache.FakeIpWriter6()}
+ 	} else {
+-		return &cachefileStore{cache.FakeIpStore()}
++		return &cachefileStore{cache.FakeIpWriter()}
+ 	}
+ }
+diff --git a/component/fakeip/pool.go b/component/fakeip/pool.go
+index 53928696..fc315eb4 100644
+--- a/component/fakeip/pool.go
++++ b/component/fakeip/pool.go
+@@ -133,6 +133,7 @@ func (p *Pool) StoreState() {
+ 		if p.cycle {
+ 			s.PutByHost(cycleKey, p.offset)
+ 		}
++		s.Sync()
+ 	}
+ }
+ 
